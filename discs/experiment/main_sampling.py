@@ -15,12 +15,13 @@ _EXPERIMENT_CONFIG = config_flags.DEFINE_config_file(
 _MODEL_CONFIG = config_flags.DEFINE_config_file('model_config')
 _SAMPLER_CONFIG = config_flags.DEFINE_config_file('sampler_config')
 _RUN_LOCAL = flags.DEFINE_boolean('run_local', False, 'if runnng local')
+_EXPERIMENT_NAME = flags.DEFINE_string('name','','name of the experiment')
 
 
 def update_save_dir(config):
   if _RUN_LOCAL.value:
     save_folder = config.model.get('save_dir_name', config.model.name)
-    save_root = './discs/results/' + save_folder
+    save_root = './discs/results/' + save_folder + f'/{_EXPERIMENT_NAME.value}'
     config.experiment.save_root = save_root
 
 

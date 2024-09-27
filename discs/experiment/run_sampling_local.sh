@@ -1,11 +1,14 @@
 #!/bin/bash
-export XLA_FLAGS='--xla_force_host_platform_device_count=4'
+export XLA_FLAGS='--xla_force_host_platform_device_count=20'
 
 default="default_value"
 graph_type=${graph_type:-$default}
+default_name="experiment"
+name=${name:-$default_name}
 echo "$model"
 echo "$sampler"
 echo "$graph_type"
+echo "$name"
 
 
 if [ "$graph_type" == "$default" ]
@@ -28,5 +31,4 @@ python -m discs.experiment.main_sampling \
   --sampler_config="discs/samplers/configs/${sampler?}_config.py" \
   --config=$exp_config \
   --run_local=True \
-
-
+  --name=$name \

@@ -34,14 +34,16 @@ class Experiment:
     rng_param, rng_x0, rng_state = jax.random.split(rnd, num=3)
     # params of the model
     params = model_init_params_fn(
-        jax.random.split(rng_param)[0]
+        #jax.random.split(rng_param)[0]
+        jax.random.split(rng_param,self.config.num_models)
     )
     # initial samples
     num_samples = self.config.batch_size * self.config.num_models
     x0 = model.get_init_samples(rng_x0, num_samples)
     # initial state of sampler
     state = sampler_init_state_fn(
-       jax.random.split(rng_param)[0]
+       #jax.random.split(rng_state)[0]
+       jax.random.split(rng_param,self.config.num_models)
     )
     return params, x0, state
 
