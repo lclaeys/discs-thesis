@@ -6,7 +6,7 @@ def get_config():
       dict(
           name='maxcut',
           graph_type='ba',
-          cfg_str='r-ba-4-n-16-20',
+          cfg_str='r-ba-4-n-512-600',
           data_root='./sco/',
       )
   )

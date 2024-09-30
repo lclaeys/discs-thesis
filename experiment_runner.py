@@ -1,7 +1,7 @@
 """Main script for sampling based experiments."""
 import importlib
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 from absl import app
 from absl import flags
@@ -13,21 +13,34 @@ from ml_collections import config_flags
 # EXPERIMENTS 
 
 experiments = [
-                {'experiment_name': 'exp_temp_decay',
-                'experiment': {'t_schedule': 'exp_decay'}},
-                {'experiment_name': 'high_temp',
+                # {'experiment_name': 'replica exchange (10 replicas)',
+                # 'experiment': {'t_schedule': 'constant',
+                #                 'name': 'RE_CO_Experiment',
+                #                 'minimum_temperature': .0001,
+                #                 'maximum_temperature': 1,
+                # #                 'num_replicas': 10},
+                # },
+                {'experiment_name': 'low temperature',
                 'experiment': {'t_schedule': 'constant',
-                               'init_temperature': 1.1}},
-                {'experiment_name': 'low_temp',
+                                'name': 'CO_Experiment',
+                                'init_temperature': .05},
+                },
+                {'experiment_name': 'high temperature',
                 'experiment': {'t_schedule': 'constant',
-                                'init_temperature': .9}}
+                                'name': 'CO_Experiment',
+                                'init_temperature': 1},
+                },
+                {'experiment_name': 'exp decaying temperature',
+                'experiment': {'t_schedule': 'exp_decay',
+                               'init_temperature': 1}},
                 ]
 
 # CONFIG
 model_name = 'mis'
 sampler_name = 'path_auxiliary'
 graph_type = 'ertest'
-experiment_folder = 'pas_lowhigh_800'
+experiment_type = 're_many'
+experiment_folder = f'{sampler_name}_{graph_type}_{experiment_type}' 
 
 experiment_config = importlib.import_module(
         f'discs.experiment.configs.{model_name}.{graph_type}'

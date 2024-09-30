@@ -6,7 +6,7 @@ def get_config():
       dict(
           name='mis',
           graph_type='ertest',
-          cfg_str='r-800',
+          cfg_str='r-10k',
           data_root='./sco/',
           penalty=1.001,
       )

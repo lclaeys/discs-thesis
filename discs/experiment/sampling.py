@@ -112,6 +112,13 @@ class Experiment:
       compiled_step = jax.pmap(step_fn)
     return compiled_step
 
+  def _compile_frwrd_step(self, frwrd_fn):
+    if not self.parallel:
+      compiled_frwrd = jax.jit(frwrd_fn)
+    else:
+      compiled_frwrd = jax.pmap(frwrd_fn)
+    return compiled_frwrd
+
   def _compile_evaluator(self, obj_fn):
     if not self.parallel:
       compiled_obj_fn = jax.jit(obj_fn)
@@ -123,22 +130,24 @@ class Experiment:
     if self.config.evaluator == 'co_eval':
       step_fn = jax.vmap(functools.partial(sampler.step, model=model))
       obj_fn = self._vmap_evaluator(evaluator, model)
+      frwrd_fn = jax.vmap(model.forward)
     else:
       step_fn = functools.partial(sampler.step, model=model)
       obj_fn = evaluator.evaluate
+      frwrd_fn = model.forward
 
     get_hop = jax.jit(self._get_hop)
     compiled_step = self._compile_sampler_step(step_fn)
     compiled_step_burnin = compiled_step
     compiled_step_mixing = compiled_step
     compiled_obj_fn = self._compile_evaluator(obj_fn)
-    model_frwrd = jax.jit(model.forward)
+    compiled_frwrd = self._compile_frwrd_step(frwrd_fn)
     return (
         compiled_step_burnin,
         compiled_step_mixing,
         get_hop,
         compiled_obj_fn,
-        model_frwrd,
+        compiled_frwrd,
     )
 
   def _get_hop(self, x, new_x):
@@ -549,7 +558,7 @@ class CO_Experiment(Experiment):
         best_samples,
     ) = self._initialize_chain_vars(bshape)
 
-    stp_burnin, stp_mixing, get_hop, obj_fn, _ = compiled_fns
+    stp_burnin, stp_mixing, get_hop, obj_fn, model_frwrd = compiled_fns
     fn_reshape = lambda x: jnp.reshape(x, bshape + x.shape[1:])
     # burn in
     burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
@@ -559,6 +568,7 @@ class CO_Experiment(Experiment):
       params['temperature'] = init_temperature * cur_temp
       rng = jax.random.fold_in(rng, step)
       step_rng = fn_reshape(jax.random.split(rng, math.prod(bshape)))
+      
       new_x, state, acc = stp_burnin(
           rng=step_rng,
           x=x,
@@ -680,6 +690,189 @@ class CO_Experiment(Experiment):
         sample_mask,
         best_samples,
     )
+
+class RE_CO_Experiment(CO_Experiment):
+  
+  def __init__(self, config):
+    super().__init__(config)
+    self.num_replicas = config.experiment.get('num_replicas',2)
+    self.min_temp= config.experiment.minimum_temperature
+    self.max_temp = config.experiment.maximum_temperature
+    self.replica_temps = jnp.logspace(jnp.log10(self.min_temp),jnp.log10(self.max_temp),self.num_replicas)
+
+  def _compute_chain(
+      self,
+      compiled_fns,
+      state,
+      params,
+      rng,
+      x,
+      saver,
+      evaluator,
+      bshape,
+      model,
+  ):
+    """Generates the chain of samples."""
+
+    (
+        chain,
+        acc_ratios,
+        hops,
+        running_time,
+        best_ratio,
+        init_temperature,
+        t_schedule,
+        sample_mask,
+        best_samples,
+    ) = self._initialize_chain_vars(bshape)
+
+    stp_burnin, stp_mixing, get_hop, obj_fn, model_frwrd = compiled_fns
+    fn_reshape = lambda x: jnp.reshape(x, bshape + x.shape[1:])
+    # burn in
+    burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
+
+    repeated_x = jnp.expand_dims(x, axis=0)
+    full_x = jnp.repeat(repeated_x, repeats=self.num_replicas,axis=0)
+
+    init_temperature = jnp.ones_like(init_temperature)
+    params['temperature'] = init_temperature
+
+    def step_and_energy(index):
+      params_copy = params.copy()
+      params_copy['temperature'] = self.replica_temps[index]*init_temperature
+      rng_new = jax.random.fold_in(rng, step*(self.num_replicas*2)+index)
+      step_rng = fn_reshape(jax.random.split(rng_new, math.prod(bshape)))
+      x = full_x[index]
+      new_partial_x, new_state, acc = stp_burnin(
+          rng=step_rng,
+          x=x,
+          model_param=params_copy,
+          state=state,
+          x_mask=params_copy['mask'],
+      )
+      params_copy['temperature'] = init_temperature
+      energy = -model_frwrd(params_copy,new_partial_x)
+      return new_partial_x, energy
+
+    def exchange_step(full_x, energies):
+
+      dims_to_add = len(full_x.shape)-len(energies.shape)
+      swap_shape = energies.shape[1:] + (1,)*dims_to_add
+
+      for i in range(self.num_replicas-2,-1,-1):
+        energy_diff = energies[i]-energies[i+1]
+        swap_prob = jnp.exp(jnp.clip((1/self.replica_temps[i]-1/self.replica_temps[i+1])*energy_diff,max=0))
+        rng_swap = jax.random.fold_in(rng, step*(self.num_replicas*2)+self.num_replicas+i)
+        
+        dims_to_add = len(full_x[0].shape)-len(energies[0].shape)
+        swap = jax.random.bernoulli(rng_swap,swap_prob).reshape(swap_shape)       
+
+        swapped_first = jnp.where(swap,full_x[i+1],full_x[i])
+        swapped_second = jnp.where(swap,full_x[i],full_x[i+1])
+        full_x = full_x.at[i].set(swapped_first)
+        full_x = full_x.at[i+1].set(swapped_second)
+      return full_x
+
+    full_step_and_energy = jax.vmap(step_and_energy)
+
+    for step in tqdm.tqdm(range(1, burn_in_length)):
+      
+      new_full_x, energies = full_step_and_energy(jnp.arange(self.num_replicas))
+      
+      new_full_x = exchange_step(new_full_x,energies)
+      
+      new_x = new_full_x[0]
+
+      #new_x, energy = step_and_energy_burnin(0)
+
+      if step % self.config.log_every_steps == 0:
+        eval_val = obj_fn(samples=new_x, params=params)
+        eval_val = eval_val.reshape(self.config.num_models, -1)
+        ratio = jnp.max(eval_val, axis=-1).reshape(-1) / self.ref_obj
+        is_better = ratio > best_ratio
+        best_ratio = jnp.maximum(ratio, best_ratio)
+        sample_mask = sample_mask.reshape(best_ratio.shape)
+
+        br = np.array(best_ratio[sample_mask])
+        br = jax.device_put(br, jax.devices('cpu')[0])
+        chain.append(br)
+
+        if self.config.save_samples or self.config_model.name == 'normcut':
+          step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
+          rnew_x = jnp.reshape(
+              new_x,
+              (self.config.num_models, self.config.batch_size)
+              + self.config_model.shape,
+          )
+          chosen_samples = jnp.take_along_axis(
+              rnew_x, jnp.expand_dims(step_chosen, -1), axis=-2
+          )
+          chosen_samples = jnp.squeeze(chosen_samples, -2)
+          best_samples = jnp.where(
+              jnp.expand_dims(is_better, -1), chosen_samples, best_samples
+          )
+
+      if self.config.get_additional_metrics:
+        # avg over all models
+        acc = jnp.mean(acc)
+        acc_ratios.append(acc)
+        # hop avg over batch size and num models
+        hops.append(get_hop(x, new_x))
+      full_x = new_full_x
+
+    for step in tqdm.tqdm(range(burn_in_length, 1 + self.config.chain_length)):
+
+      start = time.time()
+      new_full_x, energies = full_step_and_energy(jnp.arange(self.num_replicas))
+
+      new_full_x = exchange_step(new_full_x,energies)
+
+      new_x = new_full_x[0]
+      
+      running_time += time.time() - start
+      
+      if step % self.config.log_every_steps == 0:
+        eval_val = obj_fn(samples=new_x, params=params)
+        eval_val = eval_val.reshape(self.config.num_models, -1)
+        ratio = jnp.max(eval_val, axis=-1).reshape(-1) / self.ref_obj
+        is_better = ratio > best_ratio
+        best_ratio = jnp.maximum(ratio, best_ratio)
+        sample_mask = sample_mask.reshape(best_ratio.shape)
+
+        br = np.array(best_ratio[sample_mask])
+        br = jax.device_put(br, jax.devices('cpu')[0])
+        chain.append(br)
+
+        if self.config.save_samples or self.config_model.name == 'normcut':
+          step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
+          rnew_x = jnp.reshape(
+              new_x,
+              (self.config.num_models, self.config.batch_size)
+              + self.config_model.shape,
+          )
+          chosen_samples = jnp.take_along_axis(
+              rnew_x, jnp.expand_dims(step_chosen, -1), axis=-2
+          )
+          chosen_samples = jnp.squeeze(chosen_samples, -2)
+          best_samples = jnp.where(
+              jnp.expand_dims(is_better, -1), chosen_samples, best_samples
+          )
+
+      if self.config.get_additional_metrics:
+        # avg over all models
+        acc = jnp.mean(acc)
+        acc_ratios.append(acc)
+        # hop avg over batch size and num models
+        hops.append(get_hop(x, new_x))
+      full_x = new_full_x
+
+    if not (self.config.save_samples or self.config_model.name == 'normcut'):
+      best_samples = []
+    saver.save_co_resuts(
+        chain, best_ratio[sample_mask], running_time, best_samples
+    )
+    saver.save_results(acc_ratios, hops, None, running_time)
+
 
 
 class EBM_Experiment(Experiment):

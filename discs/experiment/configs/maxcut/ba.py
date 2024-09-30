@@ -9,7 +9,7 @@ def get_config():
       experiment=dict(
           batch_size=32,
           t_schedule='exp_decay',
-          chain_length=1000,
+          chain_length=10000,
           log_every_steps=10,
           init_temperature=1.0,
           decay_rate=0.1,

@@ -4,7 +4,7 @@ from ml_collections import config_dict
 
 def get_config():
   model_config = dict(
-      shape=(10000,),
+      shape=(10,),
       num_categories=2,
       init_sigma=0.5,
       name='bernoulli',
