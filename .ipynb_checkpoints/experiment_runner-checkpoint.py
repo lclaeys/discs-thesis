@@ -13,29 +13,52 @@ from ml_collections import config_flags
 # EXPERIMENTS 
 
 experiments = [
-                 {'experiment_name': 'replica exchange (5 replicas) (adaptive)',
-                 'experiment': {'t_schedule': 'constant',
-                                 'name': 'RE_CO_Experiment',
-                                 'minimum_temperature': .1,
-                                 'maximum_temperature': 1,
-                                 'num_replicas': 5,
-                                 'chain_length': 10000, 
-                                 'batch_size': 32
-                                },
-                  'sampler': {'adaptive': True}
-                },
+                #  {'experiment_name': 'replica exchange (15 replicas)',
+                #  'experiment': {'t_schedule': 'constant',
+                #                  'name': 'RE_CO_Experiment',
+                #                  'minimum_temperature': .1,
+                #                  'maximum_temperature': 1.5,
+                #                  'num_replicas': 15,
+                #                  'chain_length': 30000, 
+                #                  'batch_size': 32},
+                # },
+                # {'experiment_name': 'low temperature (adaptive)',
+                # 'experiment': {'t_schedule': 'constant',
+                #                 'name': 'CO_Experiment',
+                #                 'init_temperature': .05,
+                #                 'chain_length':20000},
+                # 'sampler': {'adaptive': True}
+                # },
+                # {'experiment_name': 'low temperature (nonadaptive)',
+                # 'experiment': {'t_schedule': 'constant',
+                #                 'name': 'CO_Experiment',
+                #                 'init_temperature': .05,
+                #                 'chain_length':20000},
+                # 'sampler': {'adaptive': False}
+                # },
+                # {'experiment_name': 'high temperature',
+                # 'experiment': {'t_schedule': 'constant',
+                #                 'name': 'CO_Experiment',
+                #                 'init_temperature': 1,
+                #                 'chain_length':15000},
+                # },
                 {'experiment_name': 'exp decaying temperature (adaptive)',
                 'experiment': {'t_schedule': 'exp_decay',
                                'init_temperature': 1,
                                'chain_length':50000},
                 'sampler': {'adaptive': True}},
+                {'experiment_name': 'exp decaying temperature (nonadaptive)',
+                'experiment': {'t_schedule': 'exp_decay',
+                               'init_temperature': 1,
+                               'chain_length':50000},
+                'sampler': {'adaptive': False}},
                 ]
 
 # CONFIG
 model_name = 'maxcut'
 sampler_name = 'path_auxiliary'
 graph_type = 'ba'
-experiment_type = 're_many_big'
+experiment_type = 'adaptive_vs_nonadaptive'
 experiment_folder = f'{sampler_name}_{graph_type}_{experiment_type}' 
 
 experiment_config = importlib.import_module(

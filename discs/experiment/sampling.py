@@ -34,16 +34,14 @@ class Experiment:
     rng_param, rng_x0, rng_state = jax.random.split(rnd, num=3)
     # params of the model
     params = model_init_params_fn(
-        #jax.random.split(rng_param)[0]
-        jax.random.split(rng_param,self.config.num_models)
+        jax.random.split(rng_param,self.config.num_models) if self.config.num_models > 1 else rng_param
     )
     # initial samples
     num_samples = self.config.batch_size * self.config.num_models
     x0 = model.get_init_samples(rng_x0, num_samples)
     # initial state of sampler
     state = sampler_init_state_fn(
-       #jax.random.split(rng_state)[0]
-       jax.random.split(rng_param,self.config.num_models)
+        jax.random.split(rng_state,self.config.num_models) if self.config.num_models > 1 else rng_state
     )
     return params, x0, state
 
@@ -321,11 +319,10 @@ class Sampling_Experiment(Experiment):
         saver.dump_samples(samples, visualize=False)
       elif (
           self.config.get_estimation_error
-          and self.config_model.name == 'bernoulli'
       ):
         saver.dump_samples(samples, visualize=False)
         # samples= np.array(samples)
-        params = params['params'][0].reshape(self.config_model.shape)
+        # params = params['params'][0].reshape(self.config_model.shape)
         saver.dump_params(params)
         # saver.plot_estimation_error(model, params, samples)
 
@@ -588,6 +585,7 @@ class CO_Experiment(Experiment):
         br = np.array(best_ratio[sample_mask])
         br = jax.device_put(br, jax.devices('cpu')[0])
         chain.append(br)
+        #jax.debug.print(f'Temp after {step} steps: {params['temperature']}')
 
         if self.config.save_samples or self.config_model.name == 'normcut':
           step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
@@ -737,12 +735,22 @@ class RE_CO_Experiment(CO_Experiment):
     init_temperature = jnp.ones_like(init_temperature)
     params['temperature'] = init_temperature
 
+    state_keys = list(state.keys())
+    state_array = jnp.array([state[key] for key in state_keys])
+    repeated_state_array = jnp.expand_dims(state_array, axis=0)
+    full_state_array = jnp.repeat(repeated_state_array, repeats=self.num_replicas,axis=0)
+
     def step_and_energy(index):
       params_copy = params.copy()
       params_copy['temperature'] = self.replica_temps[index]*init_temperature
+
       rng_new = jax.random.fold_in(rng, step*(self.num_replicas*2)+index)
       step_rng = fn_reshape(jax.random.split(rng_new, math.prod(bshape)))
+
       x = full_x[index]
+      state_array = full_state_array[index]
+      state = {state_keys[j]: state_array[j] for j in range(len(state_keys))}
+
       new_partial_x, new_state, acc = stp_burnin(
           rng=step_rng,
           x=x,
@@ -750,9 +758,12 @@ class RE_CO_Experiment(CO_Experiment):
           state=state,
           x_mask=params_copy['mask'],
       )
+
       params_copy['temperature'] = init_temperature
       energy = -model_frwrd(params_copy,new_partial_x)
-      return new_partial_x, energy
+      new_state_array = jnp.array([new_state[key] for key in state_keys])
+      
+      return new_partial_x, energy, new_state_array
 
     def exchange_step(full_x, energies):
 
@@ -777,8 +788,7 @@ class RE_CO_Experiment(CO_Experiment):
 
     for step in tqdm.tqdm(range(1, burn_in_length)):
       
-      new_full_x, energies = full_step_and_energy(jnp.arange(self.num_replicas))
-      
+      new_full_x, energies, full_state_array = full_step_and_energy(jnp.arange(self.num_replicas))
       new_full_x = exchange_step(new_full_x,energies)
       
       new_x = new_full_x[0]
@@ -823,7 +833,7 @@ class RE_CO_Experiment(CO_Experiment):
     for step in tqdm.tqdm(range(burn_in_length, 1 + self.config.chain_length)):
 
       start = time.time()
-      new_full_x, energies = full_step_and_energy(jnp.arange(self.num_replicas))
+      new_full_x, energies, full_state_array = full_step_and_energy(jnp.arange(self.num_replicas))
 
       new_full_x = exchange_step(new_full_x,energies)
 

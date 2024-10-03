@@ -1,7 +1,7 @@
 """Main script for sampling based experiments."""
 import importlib
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 from absl import app
 from absl import flags
@@ -13,29 +13,23 @@ from ml_collections import config_flags
 # EXPERIMENTS 
 
 experiments = [
-                 {'experiment_name': 'replica exchange (5 replicas) (adaptive)',
+                 {'experiment_name': 'replica exchange (2 replicas) (adaptive)',
                  'experiment': {'t_schedule': 'constant',
                                  'name': 'RE_CO_Experiment',
-                                 'minimum_temperature': .1,
+                                 'minimum_temperature': .5,
                                  'maximum_temperature': 1,
-                                 'num_replicas': 5,
-                                 'chain_length': 10000, 
-                                 'batch_size': 32
-                                },
+                                 'num_replicas': 2,
+                                 'chain_length': 1000, 
+                                 'batch_size': 32},
                   'sampler': {'adaptive': True}
-                },
-                {'experiment_name': 'exp decaying temperature (adaptive)',
-                'experiment': {'t_schedule': 'exp_decay',
-                               'init_temperature': 1,
-                               'chain_length':50000},
-                'sampler': {'adaptive': True}},
+                 }
                 ]
 
 # CONFIG
 model_name = 'maxcut'
 sampler_name = 'path_auxiliary'
 graph_type = 'ba'
-experiment_type = 're_many_big'
+experiment_type = 'state_test'
 experiment_folder = f'{sampler_name}_{graph_type}_{experiment_type}' 
 
 experiment_config = importlib.import_module(
