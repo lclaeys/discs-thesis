@@ -118,6 +118,12 @@ class Saver:
           )
           plt.imsave(image_path, np.array(img), cmap=cm.gray)
 
+  def dump_array(self, array, key_name):
+    res = {}
+    array = jnp.array(array)
+    res['array'] = array
+    self._dump_dict(res, key_name)
+
   def save_co_resuts(self, trajectory, best_ratio, running_time, best_samples):
     results = {}
     results['trajectory'] = np.array(trajectory)

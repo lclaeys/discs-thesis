@@ -8,7 +8,7 @@ def get_config():
       name='path_auxiliary',
       use_fast_path=True,
       num_flips=1,
-      adaptive=True,
+      adaptive=False,
       target_acceptance_rate=0.574,
       balancing_fn_type='SQRT',
       approx_with_grad=True,

@@ -12,29 +12,32 @@ from ml_collections import config_flags
 
 # EXPERIMENTS 
 
+max_temps = [.5,1,2,4,7,11,16]
+
 experiments = [
-                 {'experiment_name': 'replica exchange (5 replicas) (adaptive)',
+                 {'experiment_name': f'replica exchange (10 replicas)',
                  'experiment': {'t_schedule': 'constant',
                                  'name': 'RE_CO_Experiment',
                                  'minimum_temperature': .1,
                                  'maximum_temperature': 1,
-                                 'num_replicas': 5,
-                                 'chain_length': 10000, 
-                                 'batch_size': 32
+                                 'num_replicas': 10,
+                                 'chain_length': 50000, 
+                                 'batch_size': 1,
+                                 'save_replica_data': True
                                 },
-                  'sampler': {'adaptive': True}
-                },
-                {'experiment_name': 'exp decaying temperature (adaptive)',
+                  'sampler': {'adaptive': True}},
+                  {'experiment_name': 'exp decaying temperature',
                 'experiment': {'t_schedule': 'exp_decay',
                                'init_temperature': 1,
-                               'chain_length':50000},
+                               'chain_length': 500000,
+                               'batch_size': 1},
                 'sampler': {'adaptive': True}},
                 ]
 
 # CONFIG
-model_name = 'maxcut'
-sampler_name = 'path_auxiliary'
-graph_type = 'ba'
+model_name = 'mis'
+sampler_name = 'dlmc'
+graph_type = 'satlib'
 experiment_type = 're_many_big'
 experiment_folder = f'{sampler_name}_{graph_type}_{experiment_type}' 
 

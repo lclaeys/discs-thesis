@@ -66,6 +66,7 @@ class DLMCSampler(locallybalanced.LocallyBalancedSampler):
       self.schedule_step = config.sampler.schedule_step
     self.reset_z_est = config.sampler.get('reset_z_est', -1)
     self.solver = config.sampler.get('solver', 'interpolate')
+    self.step_size = config.sampler.get('step_size',1)
 
   def make_init_state(self, rng):
     state = super().make_init_state(rng)
@@ -149,6 +150,7 @@ class CategoricalDLMC(DLMCSampler):
   def get_dist_at(self, x, log_tau, log_rate_x):
     log_weight_x = log_rate_x['weights']
     log_nu_x = jax.nn.log_softmax(log_rate_x['delta'], axis=-1)
+    
     if self.solver == 'interpolate':
       log_posterior_x = log_nu_x + math.log1mexp(
           -jnp.exp(log_tau + log_weight_x - log_nu_x)

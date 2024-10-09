@@ -697,6 +697,11 @@ class RE_CO_Experiment(CO_Experiment):
     self.min_temp= config.experiment.minimum_temperature
     self.max_temp = config.experiment.maximum_temperature
     self.replica_temps = jnp.logspace(jnp.log10(self.min_temp),jnp.log10(self.max_temp),self.num_replicas)
+    self.save_replica_data = config.experiment.get('save_replica_data',False)
+    self.batch_size = config.experiment.get('batch_size',1)
+    self.adaptive_temps = config.experiment.get('adaptive_temps', False)
+    self.target_swap_prob = 0.2
+    self.update_temps_every = 50
 
   def _compute_chain(
       self,
@@ -733,16 +738,32 @@ class RE_CO_Experiment(CO_Experiment):
     full_x = jnp.repeat(repeated_x, repeats=self.num_replicas,axis=0)
 
     init_temperature = jnp.ones_like(init_temperature)
+    repeated_init_temperature = jnp.expand_dims(init_temperature, axis=-1)
+    init_temperature = jnp.repeat(repeated_init_temperature, repeats=self.batch_size,axis=-1)
+
     params['temperature'] = init_temperature
 
     state_keys = list(state.keys())
     state_array = jnp.array([state[key] for key in state_keys])
     repeated_state_array = jnp.expand_dims(state_array, axis=0)
     full_state_array = jnp.repeat(repeated_state_array, repeats=self.num_replicas,axis=0)
+    
+    self.init_replica_temps = jnp.expand_dims(self.replica_temps,axis=1+jnp.arange(len(init_temperature.shape)))*jnp.expand_dims(init_temperature,axis=0)
+    
+    if self.save_replica_data:
+      #track the temperature of a particle
+      swap_probs = []
+      energies_array = []
+      temp_tracker_array = []
+
+      #temp_tracker = self.replica_temps.copy()
+      temp_tracker = None
+      if self.adaptive_temps:
+        temp_array = []
 
     def step_and_energy(index):
       params_copy = params.copy()
-      params_copy['temperature'] = self.replica_temps[index]*init_temperature
+      params_copy['temperature'] = self.replica_temps[index]
 
       rng_new = jax.random.fold_in(rng, step*(self.num_replicas*2)+index)
       step_rng = fn_reshape(jax.random.split(rng_new, math.prod(bshape)))
@@ -765,14 +786,19 @@ class RE_CO_Experiment(CO_Experiment):
       
       return new_partial_x, energy, new_state_array
 
-    def exchange_step(full_x, energies):
+    def exchange_step(full_x, energies, return_swap_prob = False, temp_tracker = None):
 
       dims_to_add = len(full_x.shape)-len(energies.shape)
       swap_shape = energies.shape[1:] + (1,)*dims_to_add
 
+      if return_swap_prob:
+        swap_probs = [0]*(self.num_replicas-1)
+
       for i in range(self.num_replicas-2,-1,-1):
         energy_diff = energies[i]-energies[i+1]
         swap_prob = jnp.exp(jnp.clip((1/self.replica_temps[i]-1/self.replica_temps[i+1])*energy_diff,max=0))
+        swap_probs[i] = swap_prob
+
         rng_swap = jax.random.fold_in(rng, step*(self.num_replicas*2)+self.num_replicas+i)
         
         dims_to_add = len(full_x[0].shape)-len(energies[0].shape)
@@ -782,15 +808,57 @@ class RE_CO_Experiment(CO_Experiment):
         swapped_second = jnp.where(swap,full_x[i],full_x[i+1])
         full_x = full_x.at[i].set(swapped_first)
         full_x = full_x.at[i+1].set(swapped_second)
+
+        if temp_tracker is not None:
+          swap = jnp.reshape(swap,temp_tracker.shape[1:])
+          swapped_first = jnp.where(swap,temp_tracker[i+1],temp_tracker[i])
+          swapped_second = jnp.where(swap,temp_tracker[i],temp_tracker[i+1])
+          temp_tracker = temp_tracker.at[i].set(swapped_first)
+          temp_tracker = temp_tracker.at[i+1].set(swapped_second)
+
+      if return_swap_prob:
+        if temp_tracker is not None:
+          return full_x, jnp.array(swap_probs), temp_tracker
+        return full_x, jnp.array(swap_probs)
+      
       return full_x
 
     full_step_and_energy = jax.vmap(step_and_energy)
 
     for step in tqdm.tqdm(range(1, burn_in_length)):
       
+      cur_temp = t_schedule(step)
+      self.replica_temps = self.init_replica_temps * cur_temp
+
       new_full_x, energies, full_state_array = full_step_and_energy(jnp.arange(self.num_replicas))
-      new_full_x = exchange_step(new_full_x,energies)
       
+      if self.save_replica_data:
+        if temp_tracker is not None:
+          new_full_x, swap_prob, temp_tracker = exchange_step(new_full_x,energies,return_swap_prob=True,temp_tracker=temp_tracker)
+        else:
+          new_full_x, swap_prob = exchange_step(new_full_x,energies,True)
+      else:
+        new_full_x = exchange_step(new_full_x,energies)
+
+      if self.adaptive_temps:
+        if step == 1:
+          running_swap_prob = jnp.zeros_like(swap_prob)
+        
+        running_swap_prob += swap_prob
+
+        if step % self.update_temps_every == 0:
+          running_swap_prob /= self.update_temps_every
+          log_lowest_temp = jnp.log(self.replica_temps[0])
+
+          log_temp_diffs = jnp.diff(jnp.log(self.replica_temps),axis=0)
+          delta = -jnp.clip(jnp.log(running_swap_prob)-jnp.log(self.target_swap_prob),a_min=jnp.log(self.target_swap_prob))/jnp.log(self.target_swap_prob)
+          log_temp_diffs = log_temp_diffs*(1+delta*.1)
+          
+          self.replica_temps = self.replica_temps.at[1:].set(jnp.clip(np.exp(jnp.cumsum(log_temp_diffs,axis=0)+log_lowest_temp),a_max=10))
+
+          temp_array.append(jnp.array([self.replica_temps]))
+          running_swap_prob = jnp.zeros_like(swap_prob)
+
       new_x = new_full_x[0]
 
       #new_x, energy = step_and_energy_burnin(0)
@@ -806,6 +874,10 @@ class RE_CO_Experiment(CO_Experiment):
         br = np.array(best_ratio[sample_mask])
         br = jax.device_put(br, jax.devices('cpu')[0])
         chain.append(br)
+
+        swap_probs.append(jnp.array([swap_prob]))
+        energies_array.append(jnp.array([energies]))
+        temp_tracker_array.append(jnp.array([temp_tracker]))
 
         if self.config.save_samples or self.config_model.name == 'normcut':
           step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
@@ -824,6 +896,7 @@ class RE_CO_Experiment(CO_Experiment):
 
       if self.config.get_additional_metrics:
         # avg over all models
+        swap_acc = jnp.mean(swap_acc)
         acc = jnp.mean(acc)
         acc_ratios.append(acc)
         # hop avg over batch size and num models
@@ -831,12 +904,24 @@ class RE_CO_Experiment(CO_Experiment):
       full_x = new_full_x
 
     for step in tqdm.tqdm(range(burn_in_length, 1 + self.config.chain_length)):
+      
+      cur_temp = t_schedule(step)
+      self.replica_temps = self.init_replica_temps * cur_temp
 
       start = time.time()
       new_full_x, energies, full_state_array = full_step_and_energy(jnp.arange(self.num_replicas))
 
-      new_full_x = exchange_step(new_full_x,energies)
+      if self.save_replica_data:
+        if temp_tracker is not None:
+          new_full_x, swap_prob, temp_tracker = exchange_step(new_full_x,energies,return_swap_prob=True,temp_tracker=temp_tracker)
+        else:
+          new_full_x, swap_prob = exchange_step(new_full_x,energies,True)
+      else:
+        new_full_x = exchange_step(new_full_x,energies)
 
+      
+        
+      
       new_x = new_full_x[0]
       
       running_time += time.time() - start
@@ -852,6 +937,9 @@ class RE_CO_Experiment(CO_Experiment):
         br = np.array(best_ratio[sample_mask])
         br = jax.device_put(br, jax.devices('cpu')[0])
         chain.append(br)
+        swap_probs.append(jnp.array([swap_prob]))
+        energies_array.append(jnp.array([energies]))
+        temp_tracker_array.append(jnp.array([temp_tracker]))
 
         if self.config.save_samples or self.config_model.name == 'normcut':
           step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
@@ -883,6 +971,12 @@ class RE_CO_Experiment(CO_Experiment):
     )
     saver.save_results(acc_ratios, hops, None, running_time)
 
+    if self.save_replica_data:
+      saver.dump_array(jnp.concatenate(swap_probs),'swap_probs')
+      saver.dump_array(jnp.concatenate(energies_array),'energies')
+      saver.dump_array(jnp.concatenate(temp_tracker_array),'temp_tracker')
+      if self.adaptive_temps:
+        saver.dump_array(jnp.concatenate(temp_array),'temps')
 
 
 class EBM_Experiment(Experiment):

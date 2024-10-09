@@ -12,5 +12,6 @@ def get_config():
       reset_z_est=20,
       solver='interpolate',
       n=3.0,
+      step_size=.2
   )
   return config_dict.ConfigDict(sampler_config)
