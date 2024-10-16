@@ -19,7 +19,7 @@ class Experiment:
     self.config_model = config.model
     self.parallel = False
     self.sample_idx = None
-    self.num_saved_samples = config.get('nun_saved_samples', 4)
+    self.num_saved_samples = config.experiment.get('num_saved_samples', 4)
     if jax.local_device_count() != 1 and self.config.run_parallel:
       self.parallel = True
 
@@ -701,7 +701,7 @@ class RE_CO_Experiment(CO_Experiment):
     self.batch_size = config.experiment.get('batch_size',1)
     self.adaptive_temps = config.experiment.get('adaptive_temps', False)
     self.target_swap_prob = 0.2
-    self.update_temps_every = 50
+    self.update_temps_every = 250
 
   def _compute_chain(
       self,
@@ -828,7 +828,8 @@ class RE_CO_Experiment(CO_Experiment):
     for step in tqdm.tqdm(range(1, burn_in_length)):
       
       cur_temp = t_schedule(step)
-      self.replica_temps = self.init_replica_temps * cur_temp
+      if step == 1 or not self.adaptive_temps:
+        self.replica_temps = self.init_replica_temps * cur_temp
 
       new_full_x, energies, full_state_array = full_step_and_energy(jnp.arange(self.num_replicas))
       
@@ -851,11 +852,15 @@ class RE_CO_Experiment(CO_Experiment):
           log_lowest_temp = jnp.log(self.replica_temps[0])
 
           log_temp_diffs = jnp.diff(jnp.log(self.replica_temps),axis=0)
-          delta = -jnp.clip(jnp.log(running_swap_prob)-jnp.log(self.target_swap_prob),a_min=jnp.log(self.target_swap_prob))/jnp.log(self.target_swap_prob)
-          log_temp_diffs = log_temp_diffs*(1+delta*.1)
-          
-          self.replica_temps = self.replica_temps.at[1:].set(jnp.clip(np.exp(jnp.cumsum(log_temp_diffs,axis=0)+log_lowest_temp),a_max=10))
+          #delta = -jnp.clip(jnp.log(running_swap_prob)-jnp.log(self.target_swap_prob),a_min=jnp.log(self.target_swap_prob))/jnp.log(self.target_swap_prob)
+          #log_temp_diffs = log_temp_diffs*(1+delta/2)
 
+          ratio_log_acc = jnp.clip(jnp.log(self.target_swap_prob)/jnp.log(running_swap_prob),a_min=0.5,a_max=2)
+          print(ratio_log_acc[1][0][0])
+          log_temp_diffs = log_temp_diffs*ratio_log_acc
+
+          self.replica_temps = self.replica_temps.at[1:].set(jnp.clip(np.exp(jnp.cumsum(log_temp_diffs,axis=0)+log_lowest_temp),a_max=10))
+          print(self.replica_temps[1][0][0])
           temp_array.append(jnp.array([self.replica_temps]))
           running_swap_prob = jnp.zeros_like(swap_prob)
 
@@ -906,7 +911,8 @@ class RE_CO_Experiment(CO_Experiment):
     for step in tqdm.tqdm(range(burn_in_length, 1 + self.config.chain_length)):
       
       cur_temp = t_schedule(step)
-      self.replica_temps = self.init_replica_temps * cur_temp
+      if not self.adaptive_temps:
+        self.replica_temps = self.init_replica_temps * cur_temp
 
       start = time.time()
       new_full_x, energies, full_state_array = full_step_and_energy(jnp.arange(self.num_replicas))

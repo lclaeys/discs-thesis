@@ -4,9 +4,9 @@ from ml_collections import config_dict
 
 def get_config():
   model_config = dict(
-      shape=(50, 50),
+      shape=(10, 10),
       num_categories=2,
-      lambdaa=5,
+      lambdaa=0.5,
       external_field_type=1,
       mu=0.5,
       init_sigma=1.5,

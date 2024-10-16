@@ -13,29 +13,26 @@ from ml_collections import config_flags
 # EXPERIMENTS 
 
 experiments = [
-                 {'experiment_name': 'replica exchange (2 replicas) (adaptive)',
-                 'experiment': {'t_schedule': 'constant',
-                                 'name': 'RE_CO_Experiment',
-                                 'minimum_temperature': .5,
-                                 'maximum_temperature': 1,
-                                 'num_replicas': 2,
-                                 'chain_length': 1000, 
-                                 'batch_size': 32},
-                  'sampler': {'adaptive': True}
+                 {'experiment_name': 'sampling_test',
+                  'sampler': {'adaptive': True},
+                  'model': {'shape': (10,10),
+                            'lambdaa': 1,
+                            'mu': 0,
+                            'init_sigma':0},
+                  'experiment': {'chain_length': 2500000,
+                                 'num_saved_samples': 10,
+                                 'batch_size': 100,
+                                 'save_every_steps':10000,
+                                 'save_samples': False}
                  }
                 ]
 
 # CONFIG
-model_name = 'maxcut'
-sampler_name = 'path_auxiliary'
-graph_type = 'ba'
-experiment_type = 'state_test'
-experiment_folder = f'{sampler_name}_{graph_type}_{experiment_type}' 
+model_name = 'ising'
+sampler_name = 'dlmc'
+experiment_type = 'test'
 
-experiment_config = importlib.import_module(
-        f'discs.experiment.configs.{model_name}.{graph_type}'
-    )
-experiment_config = experiment_config.get_config()
+experiment_folder = f'{sampler_name}_{experiment_type}' 
 
 model_config = importlib.import_module(
         f'discs.models.configs.{model_name}_config'
@@ -63,7 +60,7 @@ def get_main_config():
       'graph_type' not in model_config
       and 'bert_model' not in model_config
   ):
-    config.update(experiment_config)
+    pass
   config.sampler.update(sampler_config)
   config.model.update(model_config)
   if config.model.get('graph_type', None):
@@ -76,12 +73,10 @@ def get_main_config():
         'discs.experiment.configs.co_experiment'
     )
     config.experiment.update(co_exp_default_config.get_co_default_config())
-    config.update(experiment_config)
     config.experiment.num_models = config.model.num_models
 
   if config.model.get('bert_model', None):
-    config.update(experiment_config)
-
+    pass
   return config
 
 

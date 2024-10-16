@@ -4,6 +4,7 @@ from discs.evaluators import abstractevaluator
 import jax.numpy as jnp
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow_probability.substrates import jax as tfp_jax
 
 class ESSevaluator(abstractevaluator.AbstractEvaluator):
   """ESS evaluator class."""
@@ -34,8 +35,11 @@ class ESSevaluator(abstractevaluator.AbstractEvaluator):
     """Computes the mean ESS over the chains."""
     mapped_samples = mapped_samples.astype(jnp.float32)
     tf.config.experimental.enable_tensor_float_32_execution(False)
-    ess_of_chains = tfp.substrates.jax.mcmc.effective_sample_size(
-        mapped_samples
+
+    print(str(mapped_samples.shape))
+    print(str(mapped_samples))
+    ess_of_chains = tfp_jax.mcmc.effective_sample_size(
+       mapped_samples
     )
     ess_of_chains = jnp.nan_to_num(ess_of_chains, nan=1.0)
     mean_ess = jnp.mean(ess_of_chains)

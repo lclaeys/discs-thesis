@@ -42,6 +42,7 @@ class ErTestGraphGen(MISGen):
       if fname.startswith('ER'):
         file_list.append(os.path.join(data_folder, fname))
     self.file_list = sorted(file_list)
+    print(self.file_list)
     if (
         model_config.max_num_nodes > 0
         and model_config.max_num_edges > 0

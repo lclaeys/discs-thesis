@@ -18,8 +18,18 @@ def get_model_config(cfg_str):
     num_edges = 1190799
     num_instances = 16
 
+  elif rand_type == '10k10':
+    num_nodes = 10000
+    num_edges = 5002123
+    num_instances = 16
+
+  elif rand_type == '10k20':
+    num_nodes = 10000
+    num_edges = 10002776
+    num_instances = 8
+
   model_config = dict(
-      num_models=128,
+      num_models=num_instances,
       max_num_nodes=num_nodes,
       max_num_edges=num_edges,
       num_instances=num_instances,
