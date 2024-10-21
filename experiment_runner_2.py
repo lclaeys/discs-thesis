@@ -1,7 +1,8 @@
 """Main script for sampling based experiments."""
 import importlib
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+import numpy as np
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 from absl import app
 from absl import flags
@@ -12,21 +13,83 @@ from ml_collections import config_flags
 
 # EXPERIMENTS 
 
+shape = (4,4)
+chain_length = 1_000_000
+init_sigma = 0.6
+
+temps = np.logspace(-np.log10(2),1,10)
+temp_mults = np.logspace(np.log10(2),1,10)
+setups = [(t,mult) for t in temps for mult in temp_mults]
+
 experiments = [
-                 {'experiment_name': 'sampling_test',
+                 {'experiment_name': f'sampling_{t:.2f}_re10_{mult:.2f}x',
                   'sampler': {'adaptive': True},
-                  'model': {'shape': (10,10),
+                  'model': {'shape': shape,
                             'lambdaa': 1,
                             'mu': 0,
                             'init_sigma':0},
-                  'experiment': {'chain_length': 2500000,
+                  'experiment': {'name': 'RE_Sampling_Experiment',
+                                 'chain_length': chain_length,
                                  'num_saved_samples': 10,
-                                 'batch_size': 100,
-                                 'save_every_steps':10000,
-                                 'save_samples': False}
+                                 'batch_size': 20,
+                                 'save_every_steps':1000,
+                                 'save_samples': False,
+                                 'num_replicas': 10,
+                                 'minimum_temperature':t,
+                                 'maximum_temperature':t*mult,
+                                 'save_replica_data': False}
                  }
-                ]
+              for t, mult in setups] + [
+                 {'experiment_name': f'sampling_{t:.2f}',
+                  'sampler': {'adaptive': True},
+                  'model': {'shape': shape,
+                            'lambdaa': 1,
+                            'mu': 0,
+                            'init_sigma':0,
+                            'temperature':t},
+                  'experiment': {'name': 'Sampling_Experiment',
+                                 'chain_length': chain_length,
+                                 'num_saved_samples': 1,
+                                 'batch_size': 20,
+                                 'save_every_steps':1000,
+                                 'save_samples': False
+                                 }
+                 }
+                for t in temps]
 
+experiments = [{'experiment_name': f'sampling_re',
+                  'sampler': {'adaptive': True},
+                  'model': {'shape': shape,
+                            'lambdaa': 1,
+                            'mu': 0,
+                            'init_sigma':init_sigma},
+                  'experiment': {'name': 'RE_Sampling_Experiment',
+                                 'chain_length': chain_length,
+                                 'num_saved_samples': 10,
+                                 'batch_size': 20,
+                                 'save_every_steps':100,
+                                 'save_samples': False,
+                                 'num_replicas': 3,
+                                 'minimum_temperature':1,
+                                 'maximum_temperature':10,
+                                 'save_replica_data': True,
+                                 'adaptive_temps': True}
+                 },
+                 {'experiment_name': f'sampling',
+                  'sampler': {'adaptive': True},
+                  'model': {'shape': shape,
+                            'lambdaa': 1,
+                            'mu': 0,
+                            'init_sigma':init_sigma,
+                            'temperature':1},
+                  'experiment': {'name': 'Sampling_Experiment',
+                                 'chain_length': chain_length,
+                                 'num_saved_samples': 1,
+                                 'batch_size': 20,
+                                 'save_every_steps':1000,
+                                 'save_samples': False
+                                 }
+                 }]
 # CONFIG
 model_name = 'ising'
 sampler_name = 'dlmc'

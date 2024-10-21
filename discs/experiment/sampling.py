@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tqdm
+import types
 
 
 class Experiment:
@@ -22,6 +23,9 @@ class Experiment:
     self.num_saved_samples = config.experiment.get('num_saved_samples', 4)
     if jax.local_device_count() != 1 and self.config.run_parallel:
       self.parallel = True
+    self.replica_exchange = False
+    self.temperature = config.model.get('temperature',1.0)
+    self.verbose = False
 
   def _initialize_model_and_sampler(self, rnd, model, sampler):
     """Initializes model params, sampler state and gets the initial samples."""
@@ -30,6 +34,19 @@ class Experiment:
       sampler_init_state_fn = jax.vmap(sampler.make_init_state)
     else:
       sampler_init_state_fn = sampler.make_init_state
+
+    # include temperature for sampling
+    if self.replica_exchange or self.temperature != 1.0:
+      print('Updating forward method')
+      def temperature_forward(self, params, x):
+        # Call the original forward method
+        original_fwd = self._original_forward(params, x)
+        # Multiply the result by the temperature
+        return original_fwd / params['temperature']
+
+      model._original_forward = model.forward
+      model.forward = types.MethodType(temperature_forward, model)
+
     model_init_params_fn = model.make_init_params
     rng_param, rng_x0, rng_state = jax.random.split(rnd, num=3)
     # params of the model
@@ -236,7 +253,7 @@ class Sampling_Experiment(Experiment):
     # sample used to map for ess computation
     rng_x0_ess, rng = jax.random.split(rng)
     x0_ess = model.get_init_samples(rng_x0_ess, 1)
-    stp_burnin, stp_mixing, get_hop, obj_fn, _ = compiled_fns
+    stp_burnin, stp_mixing, get_hop, obj_fn, model_frwrd = compiled_fns
     get_mapped_samples, eval_metric = self._compile_additional_fns(evaluator)
     rng = jax.random.PRNGKey(10)
     selected_chains = jax.random.choice(
@@ -245,6 +262,11 @@ class Sampling_Experiment(Experiment):
         shape=(self.num_saved_samples,),
         replace=False,
     )
+    
+    init_temperature = jnp.ones(bshape, dtype=jnp.float32)*self.temperature
+    params['temperature'] = init_temperature
+    energies_array = []
+    magnetizations = []
 
     # burn in
     burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
@@ -257,6 +279,12 @@ class Sampling_Experiment(Experiment):
           model_param=params,
           state=state,
       )
+      
+      energies = -model_frwrd(params,new_x)
+      if self.verbose:
+        print(new_x[0])
+        print(energies[0])
+      energies_array.append(jnp.array([energies]))
 
       if (
           self.config.save_samples or self.config.get_estimation_error
@@ -283,6 +311,13 @@ class Sampling_Experiment(Experiment):
           state=state,
       )
       running_time += time.time() - start
+
+      energies = -model_frwrd(params,new_x)
+      if self.verbose:
+        print(new_x[0])
+        print(energies[0])
+      energies_array.append(jnp.array([energies]))
+      magnetizations.append(jnp.array([(2*new_x-1).sum(axis=[-1,-2])]))
 
       if (
           self.config.save_samples or self.config.get_estimation_error
@@ -325,6 +360,10 @@ class Sampling_Experiment(Experiment):
         # params = params['params'][0].reshape(self.config_model.shape)
         saver.dump_params(params)
         # saver.plot_estimation_error(model, params, samples)
+    
+    print(f'running time: {running_time}')
+    saver.dump_array(jnp.concatenate(energies_array),'energies')
+    saver.dump_array(jnp.concatenate(magnetizations),'magnetizations')
 
   def _initialize_chain_vars(self):
     chain = []
@@ -333,6 +372,338 @@ class Sampling_Experiment(Experiment):
     samples = []
     running_time = 0
 
+    return (
+        chain,
+        acc_ratios,
+        hops,
+        running_time,
+        samples,
+    )
+
+  def _compile_additional_fns(self, evaluator):
+    get_mapped_samples = jax.jit(self._get_mapped_samples)
+    eval_metric = jax.jit(evaluator.get_eval_metrics)
+    return get_mapped_samples, eval_metric
+
+  def _get_mapped_samples(self, samples, x0_ess):
+    samples = samples.reshape((-1,) + self.config_model.shape)
+    samples = samples.reshape(samples.shape[0], -1)
+    x0_ess = x0_ess.reshape((-1,) + self.config_model.shape)
+    x0_ess = x0_ess.reshape(x0_ess.shape[0], -1)
+    return jnp.sum(jnp.abs(samples - x0_ess), -1)
+
+class RE_Sampling_Experiment(Experiment):
+  """Class used to run classical graphical models and computes ESS."""
+
+  def __init__(self, config):
+    super().__init__(config)
+    self.num_replicas = config.experiment.get('num_replicas',2)
+    self.min_temp= config.experiment.minimum_temperature
+    self.max_temp = config.experiment.maximum_temperature
+    self.replica_temps = jnp.logspace(jnp.log10(self.min_temp),jnp.log10(self.max_temp),self.num_replicas)
+    self.save_replica_data = config.experiment.get('save_replica_data',False)
+    self.batch_size = config.experiment.get('batch_size',1)
+    self.adaptive_temps = config.experiment.get('adaptive_temps', False)
+    self.target_swap_prob = 0.2
+    self.update_temps_every = 5000
+    self.replica_exchange = True
+
+  def _vmap_evaluator(self, evaluator, model):
+    obj_fn = evaluator.evaluate
+    return obj_fn
+
+  def _compute_chain(
+      self,
+      compiled_fns,
+      state,
+      params,
+      rng,
+      x,
+      saver,
+      evaluator,
+      bshape,
+      model,
+  ):
+    """Generates the chain of samples."""
+    assert self.config.num_models == 1
+    (chain, acc_ratios, hops, running_time, samples) = (
+        self._initialize_chain_vars()
+    )
+
+    fn_reshape = lambda x: jnp.reshape(x, bshape + x.shape[1:])
+    # sample used to map for ess computation
+    rng_x0_ess, rng = jax.random.split(rng)
+    x0_ess = model.get_init_samples(rng_x0_ess, 1)
+    get_mapped_samples, eval_metric = self._compile_additional_fns(evaluator)
+    rng = jax.random.PRNGKey(10)
+    selected_chains = jax.random.choice(
+        rng,
+        jnp.arange(self.config.batch_size),
+        shape=(self.num_saved_samples,),
+        replace=False,
+    )
+    print(self.min_temp)
+    print(self.max_temp)
+    stp_burnin, stp_mixing, get_hop, obj_fn, model_frwrd = compiled_fns
+
+    repeated_x = jnp.expand_dims(x, axis=0)
+    full_x = jnp.repeat(repeated_x, repeats=self.num_replicas,axis=0)
+
+    init_temperature = jnp.ones(bshape, dtype=jnp.float32)*self.min_temp
+    repeated_init_temperature = jnp.expand_dims(init_temperature, axis=-1)
+    init_temperature = jnp.repeat(repeated_init_temperature, repeats=self.batch_size,axis=-1)
+
+    params['temperature'] = init_temperature
+
+    # temperature order
+    replica_labels = jnp.arange(self.num_replicas, dtype=jnp.int32)
+    repeated_replica_labels = jnp.expand_dims(replica_labels, axis=-1)
+    replica_labels = jnp.repeat(repeated_replica_labels, repeats=self.batch_size,axis=-1)
+
+    state_keys = list(state.keys())
+    state_array = jnp.array([state[key] for key in state_keys])
+    repeated_state_array = jnp.expand_dims(state_array, axis=0)
+    full_state_array = jnp.repeat(repeated_state_array, repeats=self.num_replicas,axis=0)
+    
+    self.init_replica_temps = jnp.expand_dims(self.replica_temps,axis=1+jnp.arange(len(init_temperature.shape)))*jnp.expand_dims(init_temperature,axis=0)
+    
+    magnetizations = []
+
+    if self.save_replica_data:
+      #track the temperature of a particle
+      swap_probs = []
+      energies_array = []
+      temp_tracker_array = []
+
+      #temp_tracker = self.replica_temps.copy()
+      temp_tracker = None
+      if self.adaptive_temps:
+        temp_array = []
+
+    def step_and_energy(x, state_array, temperature, rng, params):
+      params_copy = params.copy()
+      params_copy['temperature'] = temperature
+
+      step_rng = fn_reshape(jax.random.split(rng, math.prod(bshape)))
+
+      state = {state_keys[j]: state_array[j] for j in range(len(state_keys))}
+
+      new_partial_x, new_state, acc = stp_burnin(
+          rng=step_rng,
+          x=x,
+          model_param=params_copy,
+          state=state
+      )
+
+      params_copy['temperature'] = init_temperature
+      energy = -model_frwrd(params_copy,new_partial_x)
+      new_state_array = jnp.array([new_state[key] for key in state_keys])
+      
+      return new_partial_x, energy, new_state_array
+
+    def exchange_step(energies,swap_rng,temps):
+      particle_labels = jnp.reshape(jnp.repeat(jnp.arange(energies.shape[0]),energies.shape[1]),(energies.shape[0],-1))
+      
+      swap_probs = jnp.zeros((energies.shape[0]-1,energies.shape[1]))
+      for i in range(self.num_replicas-2,-1,-1):
+        energy_diff = energies[i]-energies[i+1]
+        swap_prob = jnp.exp(jnp.clip((1/temps[i]-1/temps[i+1])*energy_diff,max=0))
+        swap_probs = swap_probs.at[i].set(swap_prob)
+
+        swap = jax.random.bernoulli(swap_rng[i],swap_prob)     
+
+        swapped_first = jnp.where(swap,particle_labels[i+1],particle_labels[i])
+        swapped_second = jnp.where(swap,particle_labels[i],particle_labels[i+1])
+        particle_labels = particle_labels.at[i].set(swapped_first)
+        particle_labels = particle_labels.at[i+1].set(swapped_second)
+        
+        swapped_first = jnp.where(swap,energies[i+1],energies[i])
+        swapped_second = jnp.where(swap,energies[i],energies[i+1])
+        energies = energies.at[i].set(swapped_first)
+        energies = energies.at[i+1].set(swapped_second)
+        
+      
+      return particle_labels, swap_probs
+
+    full_step_and_energy = jax.vmap(jax.jit(functools.partial(step_and_energy, params=params)))
+    exchange_step = jax.jit(functools.partial(exchange_step,temps=self.replica_temps))
+
+    # burn in
+    burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
+
+    for step in tqdm.tqdm(range(1, burn_in_length)):
+
+      rng = jax.random.fold_in(rng, step)
+      step_rng = jax.random.split(rng,self.num_replicas)
+      
+      new_full_x, energies, full_state_array = full_step_and_energy(full_x,full_state_array,self.replica_temps,step_rng)
+      
+      if self.verbose:
+        print('Before swap')
+        print(new_full_x[:,0])
+        print(energies[:,0])
+      
+      swap_rng = jax.random.split(step_rng[0],self.num_replicas-1)
+
+      new_particle_labels, swap_prob = exchange_step(energies, swap_rng)
+      
+      if self.verbose:
+        print(f'Swap probs: {swap_prob[:,0]}')
+      
+      new_particle_labels = jnp.expand_dims(new_particle_labels, axis = jnp.arange(len(full_x.shape))[2:])
+      
+      if self.verbose:
+        print(f'New particle labels: {new_particle_labels[:,0]}')
+      
+      new_full_x = jnp.take_along_axis(new_full_x,new_particle_labels,axis=0)
+
+      new_x = new_full_x[0]
+
+      if (
+          self.config.save_samples or self.config.get_estimation_error
+      ) and step % self.config.save_every_steps == 0:
+        chains = new_x.reshape(self.config.batch_size, -1)
+        samples.append(chains[selected_chains])
+
+      if self.save_replica_data and step % self.config.save_every_steps == 0:
+        swap_probs.append(jnp.array([swap_prob]))
+        energies_array.append(jnp.array([energies]))
+
+      if self.config.get_additional_metrics:
+        # avg over all models
+        acc = jnp.mean(acc)
+        acc_ratios.append(acc)
+        # hop avg over batch size and num models
+        hops.append(get_hop(x, new_x))
+
+      if self.adaptive_temps:
+        if step == 1:
+          running_swap_prob = jnp.zeros_like(swap_prob)
+          self.replica_temps = self.init_replica_temps
+          alpha = jnp.zeros_like(swap_prob)
+        
+        running_swap_prob += swap_prob
+
+        if step % self.update_temps_every == 0:
+          running_swap_prob /= self.update_temps_every
+          log_lowest_temp = jnp.log(self.replica_temps[0])
+
+          log_temp_diffs = jnp.diff(jnp.log(self.replica_temps),axis=0)
+          #delta = -jnp.clip(jnp.log(running_swap_prob)-jnp.log(self.target_swap_prob),a_min=jnp.log(self.target_swap_prob))/jnp.log(self.target_swap_prob)
+          #log_temp_diffs = log_temp_diffs*(1+delta/2)
+
+          ratio_log_acc = jnp.clip(jnp.log(self.target_swap_prob)/jnp.log(running_swap_prob),a_min=0.5,a_max=2)
+          print(running_swap_prob[0][0])
+
+          alpha = self.config.chain_length/(self.config.chain_length + 9*step)
+          new_log_temp_diffs = ratio_log_acc*log_temp_diffs
+          log_temp_diffs = log_temp_diffs*(1-alpha) + new_log_temp_diffs*alpha
+
+          self.replica_temps = self.replica_temps.at[1:].set(jnp.clip(np.exp(jnp.cumsum(log_temp_diffs,axis=0)+log_lowest_temp),a_max=1000))
+          print(self.replica_temps[1][0])
+          temp_array.append(jnp.array([self.replica_temps]))
+          running_swap_prob = jnp.zeros_like(swap_prob)
+
+      full_x = new_full_x
+
+    forward_time = 0
+    swap_time = 0
+
+    for step in tqdm.tqdm(range(burn_in_length, 1 + self.config.chain_length)):
+      rng = jax.random.fold_in(rng, step)
+      step_rng = jax.random.split(rng,self.num_replicas)
+      
+      start = time.time()
+      
+      new_full_x, energies, full_state_array = full_step_and_energy(full_x,full_state_array,self.replica_temps,step_rng)
+
+      forward = time.time()
+      forward_time += forward - start
+
+      swap_rng = jax.random.split(step_rng[0],self.num_replicas-1)
+
+      new_particle_labels, swap_prob = exchange_step(energies, swap_rng)
+      new_particle_labels = jnp.expand_dims(new_particle_labels, axis = jnp.arange(len(full_x.shape))[2:])
+      new_full_x = jnp.take_along_axis(new_full_x,new_particle_labels,axis=0)
+      
+      new_x = new_full_x[0]
+      magnetizations.append(jnp.array([(2*new_x-1).sum(axis=[-1,-2])]))
+
+      swap = time.time()
+      swap_time += swap - forward
+
+      running_time += time.time() - start
+
+      if (
+          self.config.save_samples or self.config.get_estimation_error
+      ) and step % self.config.save_every_steps == 0:
+        chains = new_x.reshape(self.config.batch_size, -1)
+        samples.append(chains[selected_chains])
+
+      if self.save_replica_data:
+          swap_probs.append(jnp.array([swap_prob]))
+          energies_array.append(jnp.array([energies]))
+          temp_tracker_array.append(jnp.array([temp_tracker]))
+
+      if self.config.get_additional_metrics:
+        # avg over all models
+        acc = jnp.mean(acc)
+        acc_ratios.append(acc)
+        # hop avg over batch size and num models
+        hops.append(get_hop(x, new_x))
+      
+      #print(new_x)
+      mapped_sample = get_mapped_samples(new_x, x0_ess)
+      mapped_sample = jax.device_put(mapped_sample, jax.devices('cpu')[0])
+      chain.append(mapped_sample)
+      full_x = new_full_x
+
+    print(f'forward time: {forward_time}')
+    print(f'swap time: {swap_time}')
+
+    state = {state_keys[j]: full_state_array[0,j] for j in range(len(state_keys))}
+
+    chain = jnp.array(chain)
+    if self.parallel:
+      chain = jnp.array([chain])
+      rng = jnp.array([rng])
+      num_ll_calls = int(state['num_ll_calls'][0])
+    else:
+      num_ll_calls = int(state['num_ll_calls'])
+    ess = obj_fn(samples=chain, rnd=rng)
+    metrics = eval_metric(ess, running_time, num_ll_calls)
+    saver.save_results(acc_ratios, hops, metrics, running_time)
+    if self.config.save_samples or self.config.get_estimation_error:
+      if self.config.save_samples and self.config_model.name in [
+          'rbm',
+          'resnet',
+      ]:
+        saver.dump_samples(samples, visualize=False)
+      elif (
+          self.config.get_estimation_error
+      ):
+        saver.dump_samples(samples, visualize=False)
+        # samples= np.array(samples)
+        # params = params['params'][0].reshape(self.config_model.shape)
+        saver.dump_params(params)
+        # saver.plot_estimation_error(model, params, samples)
+    
+    if self.save_replica_data:
+        saver.dump_array(jnp.concatenate(swap_probs),'swap_probs')
+        saver.dump_array(jnp.concatenate(energies_array),'energies')
+        saver.dump_array(jnp.concatenate(temp_tracker_array),'temp_tracker')
+        if self.adaptive_temps:
+          saver.dump_array(jnp.concatenate(temp_array),'temps')
+
+    saver.dump_array(jnp.concatenate(magnetizations), 'magnetizations')
+
+  def _initialize_chain_vars(self):
+    chain = []
+    acc_ratios = []
+    hops = []
+    samples = []
+    running_time = 0
+  
     return (
         chain,
         acc_ratios,
@@ -809,6 +1180,12 @@ class RE_CO_Experiment(CO_Experiment):
         full_x = full_x.at[i].set(swapped_first)
         full_x = full_x.at[i+1].set(swapped_second)
 
+        swap = jnp.reshape(swap,energies.shape[1:])
+        swapped_first = jnp.where(swap,energies[i+1],energies[i])
+        swapped_second = jnp.where(swap,energies[i],energies[i+1])
+        energies = energies.at[i].set(swapped_first)
+        energies = energies.at[i+1].set(swapped_second)
+
         if temp_tracker is not None:
           swap = jnp.reshape(swap,temp_tracker.shape[1:])
           swapped_first = jnp.where(swap,temp_tracker[i+1],temp_tracker[i])
@@ -880,9 +1257,10 @@ class RE_CO_Experiment(CO_Experiment):
         br = jax.device_put(br, jax.devices('cpu')[0])
         chain.append(br)
 
-        swap_probs.append(jnp.array([swap_prob]))
-        energies_array.append(jnp.array([energies]))
-        temp_tracker_array.append(jnp.array([temp_tracker]))
+        if self.save_replica_data:
+          swap_probs.append(jnp.array([swap_prob]))
+          energies_array.append(jnp.array([energies]))
+          temp_tracker_array.append(jnp.array([temp_tracker]))
 
         if self.config.save_samples or self.config_model.name == 'normcut':
           step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
@@ -925,9 +1303,6 @@ class RE_CO_Experiment(CO_Experiment):
       else:
         new_full_x = exchange_step(new_full_x,energies)
 
-      
-        
-      
       new_x = new_full_x[0]
       
       running_time += time.time() - start
@@ -943,9 +1318,11 @@ class RE_CO_Experiment(CO_Experiment):
         br = np.array(best_ratio[sample_mask])
         br = jax.device_put(br, jax.devices('cpu')[0])
         chain.append(br)
-        swap_probs.append(jnp.array([swap_prob]))
-        energies_array.append(jnp.array([energies]))
-        temp_tracker_array.append(jnp.array([temp_tracker]))
+        
+        if self.save_replica_data:
+          swap_probs.append(jnp.array([swap_prob]))
+          energies_array.append(jnp.array([energies]))
+          temp_tracker_array.append(jnp.array([temp_tracker]))
 
         if self.config.save_samples or self.config_model.name == 'normcut':
           step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
@@ -1078,3 +1455,339 @@ class EBM_Experiment(Experiment):
       x = new_x
 
     saver.save_logz(logz_finals)
+
+class OG_Experiment:
+  """Experiment class that generates chains of samples."""
+
+  def __init__(self, config):
+    self.config = config.experiment
+    self.config_model = config.model
+    self.parallel = False
+    self.sample_idx = None
+    self.num_saved_samples = config.get('nun_saved_samples', 4)
+    if jax.local_device_count() != 1 and self.config.run_parallel:
+      self.parallel = True
+
+  def _initialize_model_and_sampler(self, rnd, model, sampler):
+    """Initializes model params, sampler state and gets the initial samples."""
+
+    if self.config.evaluator == 'co_eval':
+      sampler_init_state_fn = jax.vmap(sampler.make_init_state)
+    else:
+      sampler_init_state_fn = sampler.make_init_state
+    model_init_params_fn = model.make_init_params
+    rng_param, rng_x0, rng_state = jax.random.split(rnd, num=3)
+    # params of the model
+    params = model_init_params_fn(
+        jax.random.split(rng_param,self.config.num_models) if self.config.num_models > 1 else rng_param
+    )
+    # initial samples
+    num_samples = self.config.batch_size * self.config.num_models
+    x0 = model.get_init_samples(rng_x0, num_samples)
+    # initial state of sampler
+    state = sampler_init_state_fn(
+        jax.random.split(rng_state,self.config.num_models) if self.config.num_models > 1 else rng_state
+    )
+    return params, x0, state
+
+  def _prepare_data(self, params, x, state):
+    use_put_replicated = False
+    reshape_all = True
+    if self.config.evaluator != 'co_eval':
+      if self.parallel:
+        assert self.config.batch_size % jax.local_device_count() == 0
+        mini_batch = self.config.batch_size // jax.local_device_count()
+        bshape = (jax.local_device_count(),)
+        x_shape = bshape + (mini_batch,) + self.config_model.shape
+        use_put_replicated = True
+        if self.sample_idx:
+          self.sample_idx = jnp.array(
+              [self.sample_idx]
+              * (jax.local_device_count() // self.config.num_models)
+          )
+      else:
+        reshape_all = False
+        bshape = ()
+        x_shape = (self.config.batch_size,) + self.config_model.shape
+    else:
+      if self.parallel:
+        if self.config.num_models >= jax.local_device_count():
+          assert self.config.num_models % jax.local_device_count() == 0
+          num_models_per_device = (
+              self.config.num_models // jax.local_device_count()
+          )
+          bshape = (jax.local_device_count(), num_models_per_device)
+          x_shape = bshape + (self.config.batch_size,) + self.config_model.shape
+        else:
+          assert self.config.batch_size % jax.local_device_count() == 0
+          batch_size_per_device = (
+              self.config.batch_size // jax.local_device_count()
+          )
+          use_put_replicated = True
+          bshape = (jax.local_device_count(), self.config.num_models)
+          x_shape = bshape + (batch_size_per_device,) + self.config_model.shape
+          if self.sample_idx:
+            self.sample_idx = jnp.array(
+                [self.sample_idx]
+                * (jax.local_device_count() // self.config.num_models)
+            )
+      else:
+        bshape = (self.config.num_models,)
+        x_shape = bshape + (self.config.batch_size,) + self.config_model.shape
+    fn_breshape = lambda x: jnp.reshape(x, bshape + x.shape[1:])
+    if reshape_all:
+      if not use_put_replicated:
+        state = jax.tree_map(fn_breshape, state)
+        params = jax.tree_map(fn_breshape, params)
+      else:
+        params = jax.device_put_replicated(params, jax.local_devices())
+        state = jax.device_put_replicated(state, jax.local_devices())
+    x = jnp.reshape(x, x_shape)
+
+    print('x shape: ', x.shape)
+    print('state shape: ', state['steps'].shape)
+    return params, x, state, bshape
+
+  def _compile_sampler_step(self, step_fn):
+    if not self.parallel:
+      compiled_step = jax.jit(step_fn)
+    else:
+      compiled_step = jax.pmap(step_fn)
+    return compiled_step
+
+  def _compile_evaluator(self, obj_fn):
+    if not self.parallel:
+      compiled_obj_fn = jax.jit(obj_fn)
+    else:
+      compiled_obj_fn = jax.pmap(obj_fn)
+    return compiled_obj_fn
+
+  def _compile_fns(self, sampler, model, evaluator):
+    if self.config.evaluator == 'co_eval':
+      step_fn = jax.vmap(functools.partial(sampler.step, model=model))
+      obj_fn = self._vmap_evaluator(evaluator, model)
+    else:
+      step_fn = functools.partial(sampler.step, model=model)
+      obj_fn = evaluator.evaluate
+
+    get_hop = jax.jit(self._get_hop)
+    compiled_step = self._compile_sampler_step(step_fn)
+    compiled_step_burnin = compiled_step
+    compiled_step_mixing = compiled_step
+    compiled_obj_fn = self._compile_evaluator(obj_fn)
+    model_frwrd = jax.jit(model.forward)
+    return (
+        compiled_step_burnin,
+        compiled_step_mixing,
+        get_hop,
+        compiled_obj_fn,
+        model_frwrd,
+    )
+
+  def _get_hop(self, x, new_x):
+    return (
+        jnp.sum(abs(x - new_x))
+        / self.config.batch_size
+        / self.config.num_models
+    )
+
+  def _compute_chain(
+      self,
+      compiled_fns,
+      state,
+      params,
+      rng,
+      x,
+      saver,
+      evaluator,
+      bshape,
+      model,
+  ):
+    raise NotImplementedError
+
+  def vmap_evaluator(self, evaluator, model):
+    raise NotImplementedError
+
+  def preprocess(self, model, sampler, evaluator, saver, rnd_key=0):
+    rnd = jax.random.PRNGKey(rnd_key)
+    params, x, state = self._initialize_model_and_sampler(rnd, model, sampler)
+    if params is None:
+      print('Params is NONE')
+      return False
+    params, x, state, breshape = self._prepare_data(params, x, state)
+    compiled_fns = self._compile_fns(sampler, model, evaluator)
+    return [
+        compiled_fns,
+        state,
+        params,
+        rnd,
+        x,
+        saver,
+        evaluator,
+        breshape,
+        model,
+    ]
+
+  def _get_chains_and_evaluations(
+      self, model, sampler, evaluator, saver, rnd_key=0
+  ):
+    """Sets up the model and the samlping alg and gets the chain of samples."""
+    preprocessed_info = self.preprocess(
+        model, sampler, evaluator, saver, rnd_key=0
+    )
+    if not preprocessed_info:
+      return False
+    self._compute_chain(*preprocessed_info)
+    return True
+
+  def get_results(self, model, sampler, evaluator, saver):
+    self._get_chains_and_evaluations(model, sampler, evaluator, saver)
+
+class OG_Sampling_Experiment(OG_Experiment):
+  """Class used to run classical graphical models and computes ESS."""
+
+  def _vmap_evaluator(self, evaluator, model):
+    obj_fn = evaluator.evaluate
+    return obj_fn
+
+  def _compute_chain(
+      self,
+      compiled_fns,
+      state,
+      params,
+      rng,
+      x,
+      saver,
+      evaluator,
+      bshape,
+      model,
+  ):
+    """Generates the chain of samples."""
+    assert self.config.num_models == 1
+    (chain, acc_ratios, hops, running_time, samples) = (
+        self._initialize_chain_vars()
+    )
+    fn_reshape = lambda x: jnp.reshape(x, bshape + x.shape[1:])
+    # sample used to map for ess computation
+    rng_x0_ess, rng = jax.random.split(rng)
+    x0_ess = model.get_init_samples(rng_x0_ess, 1)
+    stp_burnin, stp_mixing, get_hop, obj_fn, model_frwrd = compiled_fns
+    get_mapped_samples, eval_metric = self._compile_additional_fns(evaluator)
+    rng = jax.random.PRNGKey(10)
+    selected_chains = jax.random.choice(
+        rng,
+        jnp.arange(self.config.batch_size),
+        shape=(self.num_saved_samples,),
+        replace=False,
+    )
+
+    # burn in
+    burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
+    for step in tqdm.tqdm(range(1, burn_in_length)):
+      rng = jax.random.fold_in(rng, step)
+      step_rng = fn_reshape(jax.random.split(rng, math.prod(bshape)))
+      new_x, state, acc = stp_burnin(
+          rng=step_rng,
+          x=x,
+          model_param=params,
+          state=state,
+      )
+      print(x[0])
+      print(model_frwrd(params,x)[0])
+
+      if (
+          self.config.save_samples or self.config.get_estimation_error
+      ) and step % self.config.save_every_steps == 0:
+        chains = new_x.reshape(self.config.batch_size, -1)
+        samples.append(chains[selected_chains])
+
+      if self.config.get_additional_metrics:
+        # avg over all models
+        acc = jnp.mean(acc)
+        acc_ratios.append(acc)
+        # hop avg over batch size and num models
+        hops.append(get_hop(x, new_x))
+      x = new_x
+
+    for step in tqdm.tqdm(range(burn_in_length, 1 + self.config.chain_length)):
+      rng = jax.random.fold_in(rng, step)
+      step_rng = fn_reshape(jax.random.split(rng, math.prod(bshape)))
+      start = time.time()
+      new_x, state, acc = stp_mixing(
+          rng=step_rng,
+          x=x,
+          model_param=params,
+          state=state,
+      )
+      running_time += time.time() - start
+
+      if (
+          self.config.save_samples or self.config.get_estimation_error
+      ) and step % self.config.save_every_steps == 0:
+        chains = new_x.reshape(self.config.batch_size, -1)
+        samples.append(chains[selected_chains])
+
+      if self.config.get_additional_metrics:
+        # avg over all models
+        acc = jnp.mean(acc)
+        acc_ratios.append(acc)
+        # hop avg over batch size and num models
+        hops.append(get_hop(x, new_x))
+      mapped_sample = get_mapped_samples(new_x, x0_ess)
+      mapped_sample = jax.device_put(mapped_sample, jax.devices('cpu')[0])
+      chain.append(mapped_sample)
+      x = new_x
+
+    chain = jnp.array(chain)
+    if self.parallel:
+      chain = jnp.array([chain])
+      rng = jnp.array([rng])
+      num_ll_calls = int(state['num_ll_calls'][0])
+    else:
+      num_ll_calls = int(state['num_ll_calls'])
+    ess = obj_fn(samples=chain, rnd=rng)
+    metrics = eval_metric(ess, running_time, num_ll_calls)
+    saver.save_results(acc_ratios, hops, metrics, running_time)
+    if self.config.save_samples or self.config.get_estimation_error:
+      if self.config.save_samples and self.config_model.name in [
+          'rbm',
+          'resnet',
+      ]:
+        saver.dump_samples(samples, visualize=False)
+      elif (
+          self.config.get_estimation_error
+          and self.config_model.name == 'bernoulli'
+      ):
+        saver.dump_samples(samples, visualize=False)
+        # samples= np.array(samples)
+        params = params['params'][0].reshape(self.config_model.shape)
+        saver.dump_params(params)
+        # saver.plot_estimation_error(model, params, samples)
+    saver.dump_params(params)
+
+  def _initialize_chain_vars(self):
+    chain = []
+    acc_ratios = []
+    hops = []
+    samples = []
+    running_time = 0
+
+    return (
+        chain,
+        acc_ratios,
+        hops,
+        running_time,
+        samples,
+    )
+
+  def _compile_additional_fns(self, evaluator):
+    get_mapped_samples = jax.jit(self._get_mapped_samples)
+    eval_metric = jax.jit(evaluator.get_eval_metrics)
+    return get_mapped_samples, eval_metric
+
+  def _get_mapped_samples(self, samples, x0_ess):
+    samples = samples.reshape((-1,) + self.config_model.shape)
+    samples = samples.reshape(samples.shape[0], -1)
+    x0_ess = x0_ess.reshape((-1,) + self.config_model.shape)
+    x0_ess = x0_ess.reshape(x0_ess.shape[0], -1)
+    return jnp.sum(jnp.abs(samples - x0_ess), -1)
