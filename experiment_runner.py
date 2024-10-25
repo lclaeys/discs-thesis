@@ -1,7 +1,7 @@
 """Main script for sampling based experiments."""
 import importlib
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 from absl import app
 from absl import flags
@@ -11,47 +11,37 @@ import discs.common.experiment_saver as saver_mod
 from ml_collections import config_flags
 
 # EXPERIMENTS 
-
+batch_size = 10
 
 experiments = [
-                 {'experiment_name': f'replica exchange (15 replicas) (proper)',
+                  {'experiment_name': f'replica exchange (10 replicas) (adaptive)',
                  'experiment': {'t_schedule': 'constant',
                                  'name': 'RE_CO_Experiment',
-                                 'minimum_temperature': .05,
-                                 'maximum_temperature': 1,
-                                 'num_replicas': 15,
-                                 'chain_length': 50000, 
-                                 'batch_size': 1,
-                                 'save_replica_data': True,
-                                 'adaptive_temps':False
-                                },
-                  'sampler': {'adaptive': True}},
-                  {'experiment_name': f'replica exchange (15 replicas) (adaptive)',
-                 'experiment': {'t_schedule': 'constant',
-                                 'name': 'RE_CO_Experiment',
-                                 'minimum_temperature': .05,
-                                 'maximum_temperature': 1,
-                                 'num_replicas': 15,
-                                 'chain_length': 50000, 
-                                 'batch_size': 1,
+                                 'init_temperature': 1,
+                                 'decay_rate': .1,
+                                 'minimum_temperature': 1,
+                                 'maximum_temperature': 10,
+                                 'num_replicas': 10,
+                                 'chain_length': 500000, 
+                                 'batch_size': batch_size,
                                  'save_replica_data': True,
                                  'adaptive_temps':True
                                 },
                   'sampler': {'adaptive': True}},
-                #   {'experiment_name': 'exp decaying temperature',
-                # 'experiment': {'t_schedule': 'exp_decay',
-                #                'init_temperature': 1,
-                #                'chain_length': 150000,
-                #                'batch_size': 1,
-                #                'decay_rate': .05  },
-                # 'sampler': {'adaptive': True}},
+                  {'experiment_name': 'exp decaying temperature',
+                'experiment': {'t_schedule': 'exp_decay',
+                               'init_temperature': 1,
+                               'chain_length': 5000000,
+                               'batch_size': batch_size,
+                               'decay_rate': .1  },
+                'sampler': {'adaptive': True}},
                 ]
 
 # CONFIG
 model_name = 'mis'
 sampler_name = 'path_auxiliary'
 graph_type = 'ertest'
-experiment_type = 're_10k05'
+experiment_type = 'new_re_800s'
 experiment_folder = f'{sampler_name}_{graph_type}_{experiment_type}' 
 
 experiment_config = importlib.import_module(

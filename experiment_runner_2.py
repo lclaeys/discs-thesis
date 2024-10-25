@@ -2,7 +2,7 @@
 import importlib
 import os
 import numpy as np
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 from absl import app
 from absl import flags
@@ -13,9 +13,10 @@ from ml_collections import config_flags
 
 # EXPERIMENTS 
 
-shape = (4,4)
-chain_length = 1_000_000
-init_sigma = 0.6
+shape = (40,40)
+chain_length = 800_000
+init_sigma = 0.1
+temperature = 1
 
 temps = np.logspace(-np.log10(2),1,10)
 temp_mults = np.logspace(np.log10(2),1,10)
@@ -57,21 +58,76 @@ experiments = [
                  }
                 for t in temps]
 
-experiments = [{'experiment_name': f'sampling_re',
+experiments = [
+                {'experiment_name': 'sampling_re_2',
                   'sampler': {'adaptive': True},
                   'model': {'shape': shape,
                             'lambdaa': 1,
                             'mu': 0,
-                            'init_sigma':init_sigma},
+                            'init_sigma':init_sigma,
+                            'temperature': temperature},
                   'experiment': {'name': 'RE_Sampling_Experiment',
                                  'chain_length': chain_length,
                                  'num_saved_samples': 10,
-                                 'batch_size': 20,
-                                 'save_every_steps':100,
+                                 'batch_size': 100,
+                                 'save_every_steps':1000,
+                                 'save_samples': False,
+                                 'num_replicas': 2,
+                                 'max_temp_mult':2,
+                                 'save_replica_data': True,
+                                 'adaptive_temps': True}
+                 },
+                 {'experiment_name': 'sampling_re_3',
+                  'sampler': {'adaptive': True},
+                  'model': {'shape': shape,
+                            'lambdaa': 1,
+                            'mu': 0,
+                            'init_sigma':init_sigma,
+                            'temperature': temperature},
+                  'experiment': {'name': 'RE_Sampling_Experiment',
+                                 'chain_length': chain_length,
+                                 'num_saved_samples': 10,
+                                 'batch_size': 100,
+                                 'save_every_steps':1000,
                                  'save_samples': False,
                                  'num_replicas': 3,
-                                 'minimum_temperature':1,
-                                 'maximum_temperature':10,
+                                 'max_temp_mult':10,
+                                 'save_replica_data': True,
+                                 'adaptive_temps': True}
+                 },
+                 {'experiment_name': 'sampling_re_5',
+                  'sampler': {'adaptive': True},
+                  'model': {'shape': shape,
+                            'lambdaa': 1,
+                            'mu': 0,
+                            'init_sigma':init_sigma,
+                            'temperature': temperature},
+                  'experiment': {'name': 'RE_Sampling_Experiment',
+                                 'chain_length': chain_length,
+                                 'num_saved_samples': 10,
+                                 'batch_size': 100,
+                                 'save_every_steps':1000,
+                                 'save_samples': False,
+                                 'num_replicas': 5,
+                                 'max_temp_mult':10,
+                                 'save_replica_data': True,
+                                 'adaptive_temps': True}
+                 },
+                 {'experiment_name': 'sampling_re_10',
+                  'sampler': {'adaptive': True},
+                  'model': {'shape': shape,
+                            'lambdaa': 1,
+                            'mu': 0,
+                            'init_sigma':init_sigma,
+                            'temperature': temperature},
+                  'experiment': {'name': 'RE_Sampling_Experiment',
+                                 'chain_length': chain_length,
+                                 'num_saved_samples': 10,
+                                 'batch_size': 100,
+                                 'save_every_steps':1000,
+                                 'save_samples': False,
+                                 'num_replicas': 10,
+                                 'max_temp_mult':10,
                                  'save_replica_data': True,
                                  'adaptive_temps': True}
                  },
@@ -81,19 +137,20 @@ experiments = [{'experiment_name': f'sampling_re',
                             'lambdaa': 1,
                             'mu': 0,
                             'init_sigma':init_sigma,
-                            'temperature':1},
+                            'temperature':temperature},
                   'experiment': {'name': 'Sampling_Experiment',
                                  'chain_length': chain_length,
                                  'num_saved_samples': 1,
-                                 'batch_size': 20,
+                                 'batch_size': 100,
                                  'save_every_steps':1000,
                                  'save_samples': False
                                  }
-                 }]
+                 }
+                ]
 # CONFIG
 model_name = 'ising'
 sampler_name = 'dlmc'
-experiment_type = 'test'
+experiment_type = '10x10'
 
 experiment_folder = f'{sampler_name}_{experiment_type}' 
 

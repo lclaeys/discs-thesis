@@ -26,6 +26,7 @@ class Experiment:
     self.replica_exchange = False
     self.temperature = config.model.get('temperature',1.0)
     self.verbose = False
+    self.batch_size = config.experiment.get('batch_size',1)
 
   def _initialize_model_and_sampler(self, rnd, model, sampler):
     """Initializes model params, sampler state and gets the initial samples."""
@@ -35,7 +36,7 @@ class Experiment:
     else:
       sampler_init_state_fn = sampler.make_init_state
 
-    # include temperature for sampling
+    # include a temperature param in every model
     if self.replica_exchange or self.temperature != 1.0:
       print('Updating forward method')
       def temperature_forward(self, params, x):
@@ -164,6 +165,130 @@ class Experiment:
         compiled_obj_fn,
         compiled_frwrd,
     )
+  
+  def get_init_replica_data(self, init_state, params, bshape, x0):
+    repeated_x = jnp.expand_dims(x0, axis=0)
+    full_x = jnp.repeat(repeated_x, repeats=self.num_replicas,axis=0)
+
+    init_temperature = jnp.ones(bshape, dtype=jnp.float32)
+    repeated_init_temperature = jnp.expand_dims(init_temperature, axis=-1)
+    init_temperature = jnp.repeat(repeated_init_temperature, repeats=self.batch_size,axis=-1)
+
+    params['temperature'] = init_temperature
+    state_keys = list(init_state.keys())
+    state_array = jnp.array([init_state[key] for key in state_keys])
+    repeated_state_array = jnp.expand_dims(state_array, axis=0)
+    full_state_array = jnp.repeat(repeated_state_array, repeats=self.num_replicas,axis=0)
+
+    init_replica_temps = jnp.expand_dims(self.replica_temps,axis=1+jnp.arange(len(init_temperature.shape)))*jnp.expand_dims(init_temperature,axis=0)
+
+    return full_x, params, full_state_array, init_replica_temps
+
+
+  def _compile_exchange_fns(self, compiled_sampler_step, compiled_frwrd, init_state, init_params, fn_reshape, bshape):
+    
+    state_keys = list(init_state.keys())
+
+    def step_and_energy(x, state_array, temperature, rng, params):
+      params_copy = params.copy()
+      params_copy['temperature'] = temperature
+
+      step_rng = fn_reshape(jax.random.split(rng, math.prod(bshape)))
+
+      state = {state_keys[j]: state_array[j] for j in range(len(state_keys))}
+
+      new_partial_x, new_state, _ = compiled_sampler_step(
+          rng=step_rng,
+          x=x,
+          model_param=params_copy,
+          state=state
+      )
+
+      energy = -compiled_frwrd(params,new_partial_x)
+      new_state_array = jnp.array([new_state[key] for key in state_keys])
+      
+      return new_partial_x, energy, new_state_array
+
+    def exchange_step(energies,swap_rng,temps,offset=0):
+      
+      arr = jnp.arange(self.num_replicas)
+      arr = arr.reshape((self.num_replicas,) + (1,) * len(energies[0].shape))
+      particle_labels = jnp.broadcast_to(arr, (self.num_replicas,) + energies[0].shape)
+
+      swap_probs = jnp.zeros((energies.shape[0]-1,) + energies.shape[1:])
+      
+      swap_indices = range(offset,self.num_replicas-1,2)
+
+      for i in swap_indices:
+        energy_diff = energies[i]-energies[i+1]
+        swap_prob = jnp.exp(jnp.clip((1/temps[i]-1/temps[i+1])*energy_diff,max=0))
+        swap_probs = swap_probs.at[i].set(swap_prob)
+
+        swap = jax.random.bernoulli(swap_rng[i],swap_prob)     
+
+        swapped_first = jnp.where(swap,particle_labels[i+1],particle_labels[i])
+        swapped_second = jnp.where(swap,particle_labels[i],particle_labels[i+1])
+        particle_labels = particle_labels.at[i].set(swapped_first)
+        particle_labels = particle_labels.at[i+1].set(swapped_second)
+      
+      return particle_labels, swap_probs
+    
+    if not self.config.evaluator == 'co_eval':
+      full_step_and_energy = jax.vmap(jax.jit(functools.partial(step_and_energy, params=init_params)))
+      exchange_step_even = jax.jit(functools.partial(exchange_step,offset=0))
+      exchange_step_odd = jax.jit(functools.partial(exchange_step,offset=1))
+    else:
+      full_step_and_energy = jax.vmap(functools.partial(step_and_energy, params=init_params))
+      exchange_step_even = functools.partial(exchange_step,offset=0)
+      exchange_step_odd = functools.partial(exchange_step,offset=1)
+      
+
+    def offset_exchange_step(energies,swap_rng,temps,offset):
+      if offset == 0:
+        return exchange_step_even(energies,swap_rng,temps)
+      elif offset == 1:
+        return exchange_step_odd(energies,swap_rng,temps)
+      else:
+        raise ValueError
+
+    def full_exchange_step(new_full_x, energies,swap_rng,temps,offset):
+      dims_to_add = len(new_full_x.shape) - len(energies.shape)
+
+      new_particle_labels, swap_prob = offset_exchange_step(energies, swap_rng, temps, offset)
+      #new_particle_labels = jnp.expand_dims(new_particle_labels, axis = jnp.arange(len(new_full_x.shape))[2:])
+      new_particle_labels = new_particle_labels.reshape(new_particle_labels.shape + (1,)*dims_to_add)
+      new_full_x = jnp.take_along_axis(new_full_x,new_particle_labels,axis=0)
+      return new_full_x, swap_prob
+
+    def adaptive_temp_step(n, running_mean, running_ssd, prob, target_acc, replica_temps, alpha):
+      new_running_mean = (n-1)/n*running_mean + 1/n*prob
+      new_running_ssd = running_ssd + (prob - running_mean)*(prob - new_running_mean)
+      std = jnp.sqrt(new_running_ssd/n)
+
+      outside_bound = (jnp.abs(new_running_mean-target_acc) > 0.3*std) & (n > 100)
+
+      # print(f'means: {new_running_mean[:,0,0]}')
+      # print(f'stds: {std[:,0,0]}')
+      # print(f'ns: {n[:,0,0]}')
+      # print(f'temps: {replica_temps[:,0,0]}')
+      log_lowest_temp = jnp.log(replica_temps[0])
+      log_temp_diffs = jnp.diff(jnp.log(replica_temps),axis=0)
+      ratio_log_acc = jnp.clip(jnp.log(target_acc)/jnp.log(new_running_mean),a_min=0.5,a_max=2)
+      new_log_temp_diffs = ratio_log_acc*log_temp_diffs
+      
+      log_temp_diffs = jnp.where(outside_bound, jnp.clip(log_temp_diffs*(1-alpha) + new_log_temp_diffs*alpha,a_min=-5,a_max=5), log_temp_diffs)
+
+      replica_temps = replica_temps.at[1:].set(jnp.clip(jnp.exp(jnp.cumsum(log_temp_diffs,axis=0)+log_lowest_temp)))
+      new_running_mean = jnp.where(outside_bound, jnp.zeros_like(new_running_mean),new_running_mean)
+      new_running_ssd = jnp.where(outside_bound, jnp.zeros_like(new_running_ssd),new_running_ssd)
+      
+      n = jnp.where(outside_bound, jnp.ones_like(n),n+1)
+
+      return n, new_running_mean, new_running_ssd, replica_temps
+    
+    return full_step_and_energy, full_exchange_step, jax.jit(adaptive_temp_step)
+
+
 
   def _get_hop(self, x, new_x):
     return (
@@ -224,6 +349,8 @@ class Experiment:
   def get_results(self, model, sampler, evaluator, saver):
     self._get_chains_and_evaluations(model, sampler, evaluator, saver)
 
+  
+
 
 class Sampling_Experiment(Experiment):
   """Class used to run classical graphical models and computes ESS."""
@@ -267,6 +394,7 @@ class Sampling_Experiment(Experiment):
     params['temperature'] = init_temperature
     energies_array = []
     magnetizations = []
+    magnetization_estimate = jnp.zeros(x.shape[0])
 
     # burn in
     burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
@@ -317,13 +445,16 @@ class Sampling_Experiment(Experiment):
         print(new_x[0])
         print(energies[0])
       energies_array.append(jnp.array([energies]))
-      magnetizations.append(jnp.array([(2*new_x-1).sum(axis=[-1,-2])]))
+      
+      n = step - burn_in_length + 1
+      magnetization_estimate = (n-1)/n*magnetization_estimate + 1/n*(jnp.array([(2*new_x-1).sum(axis=[-1,-2])]))
 
       if (
           self.config.save_samples or self.config.get_estimation_error
       ) and step % self.config.save_every_steps == 0:
         chains = new_x.reshape(self.config.batch_size, -1)
         samples.append(chains[selected_chains])
+        magnetizations.append(jnp.array([magnetization_estimate]))
 
       if self.config.get_additional_metrics:
         # avg over all models
@@ -355,14 +486,15 @@ class Sampling_Experiment(Experiment):
       elif (
           self.config.get_estimation_error
       ):
-        saver.dump_samples(samples, visualize=False)
+        if self.config.save_samples:
+          saver.dump_samples(samples, visualize=False)
         # samples= np.array(samples)
         # params = params['params'][0].reshape(self.config_model.shape)
         saver.dump_params(params)
         # saver.plot_estimation_error(model, params, samples)
     
     print(f'running time: {running_time}')
-    saver.dump_array(jnp.concatenate(energies_array),'energies')
+    #saver.dump_array(jnp.concatenate(energies_array),'energies')
     saver.dump_array(jnp.concatenate(magnetizations),'magnetizations')
 
   def _initialize_chain_vars(self):
@@ -398,11 +530,10 @@ class RE_Sampling_Experiment(Experiment):
   def __init__(self, config):
     super().__init__(config)
     self.num_replicas = config.experiment.get('num_replicas',2)
-    self.min_temp= config.experiment.minimum_temperature
-    self.max_temp = config.experiment.maximum_temperature
+    self.min_temp= config.model.temperature
+    self.max_temp = config.model.temperature*config.experiment.max_temp_mult
     self.replica_temps = jnp.logspace(jnp.log10(self.min_temp),jnp.log10(self.max_temp),self.num_replicas)
     self.save_replica_data = config.experiment.get('save_replica_data',False)
-    self.batch_size = config.experiment.get('batch_size',1)
     self.adaptive_temps = config.experiment.get('adaptive_temps', False)
     self.target_swap_prob = 0.2
     self.update_temps_every = 5000
@@ -446,26 +577,9 @@ class RE_Sampling_Experiment(Experiment):
     print(self.max_temp)
     stp_burnin, stp_mixing, get_hop, obj_fn, model_frwrd = compiled_fns
 
-    repeated_x = jnp.expand_dims(x, axis=0)
-    full_x = jnp.repeat(repeated_x, repeats=self.num_replicas,axis=0)
-
-    init_temperature = jnp.ones(bshape, dtype=jnp.float32)*self.min_temp
-    repeated_init_temperature = jnp.expand_dims(init_temperature, axis=-1)
-    init_temperature = jnp.repeat(repeated_init_temperature, repeats=self.batch_size,axis=-1)
-
-    params['temperature'] = init_temperature
-
-    # temperature order
-    replica_labels = jnp.arange(self.num_replicas, dtype=jnp.int32)
-    repeated_replica_labels = jnp.expand_dims(replica_labels, axis=-1)
-    replica_labels = jnp.repeat(repeated_replica_labels, repeats=self.batch_size,axis=-1)
-
-    state_keys = list(state.keys())
-    state_array = jnp.array([state[key] for key in state_keys])
-    repeated_state_array = jnp.expand_dims(state_array, axis=0)
-    full_state_array = jnp.repeat(repeated_state_array, repeats=self.num_replicas,axis=0)
+    full_x, params, full_state_array, init_replica_temps = self.get_init_replica_data(state,params,bshape,x)
     
-    self.init_replica_temps = jnp.expand_dims(self.replica_temps,axis=1+jnp.arange(len(init_temperature.shape)))*jnp.expand_dims(init_temperature,axis=0)
+    self.replica_temps = init_replica_temps
     
     magnetizations = []
 
@@ -473,60 +587,24 @@ class RE_Sampling_Experiment(Experiment):
       #track the temperature of a particle
       swap_probs = []
       energies_array = []
-      temp_tracker_array = []
 
-      #temp_tracker = self.replica_temps.copy()
-      temp_tracker = None
       if self.adaptive_temps:
         temp_array = []
 
-    def step_and_energy(x, state_array, temperature, rng, params):
-      params_copy = params.copy()
-      params_copy['temperature'] = temperature
+    if self.config.num_models == 1:
+      swap_prob_shape = [self.num_replicas-1] + [x.shape[0]]
+    else:
+      swap_prob_shape = (self.num_replicas-1,) + bshape + (self.config.batch_size,) 
 
-      step_rng = fn_reshape(jax.random.split(rng, math.prod(bshape)))
+    swap_prob = jnp.zeros(swap_prob_shape)
+    magnetization_estimate = jnp.zeros(x.shape[0])
 
-      state = {state_keys[j]: state_array[j] for j in range(len(state_keys))}
+    if self.adaptive_temps:
+      n = jnp.ones(swap_prob_shape)
+      running_mean = jnp.zeros(swap_prob_shape)
+      running_ssd = jnp.zeros(swap_prob_shape)
 
-      new_partial_x, new_state, acc = stp_burnin(
-          rng=step_rng,
-          x=x,
-          model_param=params_copy,
-          state=state
-      )
-
-      params_copy['temperature'] = init_temperature
-      energy = -model_frwrd(params_copy,new_partial_x)
-      new_state_array = jnp.array([new_state[key] for key in state_keys])
-      
-      return new_partial_x, energy, new_state_array
-
-    def exchange_step(energies,swap_rng,temps):
-      particle_labels = jnp.reshape(jnp.repeat(jnp.arange(energies.shape[0]),energies.shape[1]),(energies.shape[0],-1))
-      
-      swap_probs = jnp.zeros((energies.shape[0]-1,energies.shape[1]))
-      for i in range(self.num_replicas-2,-1,-1):
-        energy_diff = energies[i]-energies[i+1]
-        swap_prob = jnp.exp(jnp.clip((1/temps[i]-1/temps[i+1])*energy_diff,max=0))
-        swap_probs = swap_probs.at[i].set(swap_prob)
-
-        swap = jax.random.bernoulli(swap_rng[i],swap_prob)     
-
-        swapped_first = jnp.where(swap,particle_labels[i+1],particle_labels[i])
-        swapped_second = jnp.where(swap,particle_labels[i],particle_labels[i+1])
-        particle_labels = particle_labels.at[i].set(swapped_first)
-        particle_labels = particle_labels.at[i+1].set(swapped_second)
-        
-        swapped_first = jnp.where(swap,energies[i+1],energies[i])
-        swapped_second = jnp.where(swap,energies[i],energies[i+1])
-        energies = energies.at[i].set(swapped_first)
-        energies = energies.at[i+1].set(swapped_second)
-        
-      
-      return particle_labels, swap_probs
-
-    full_step_and_energy = jax.vmap(jax.jit(functools.partial(step_and_energy, params=params)))
-    exchange_step = jax.jit(functools.partial(exchange_step,temps=self.replica_temps))
+    full_step_and_energy, full_exchange_step, adaptive_temp_step = self._compile_exchange_fns(stp_burnin, model_frwrd, state, params, fn_reshape, bshape)
 
     # burn in
     burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
@@ -538,24 +616,10 @@ class RE_Sampling_Experiment(Experiment):
       
       new_full_x, energies, full_state_array = full_step_and_energy(full_x,full_state_array,self.replica_temps,step_rng)
       
-      if self.verbose:
-        print('Before swap')
-        print(new_full_x[:,0])
-        print(energies[:,0])
-      
       swap_rng = jax.random.split(step_rng[0],self.num_replicas-1)
 
-      new_particle_labels, swap_prob = exchange_step(energies, swap_rng)
-      
-      if self.verbose:
-        print(f'Swap probs: {swap_prob[:,0]}')
-      
-      new_particle_labels = jnp.expand_dims(new_particle_labels, axis = jnp.arange(len(full_x.shape))[2:])
-      
-      if self.verbose:
-        print(f'New particle labels: {new_particle_labels[:,0]}')
-      
-      new_full_x = jnp.take_along_axis(new_full_x,new_particle_labels,axis=0)
+      new_full_x, new_swap_prob = full_exchange_step(new_full_x, energies, swap_rng, self.replica_temps, step % 2)
+      swap_prob += new_swap_prob
 
       new_x = new_full_x[0]
 
@@ -568,7 +632,8 @@ class RE_Sampling_Experiment(Experiment):
       if self.save_replica_data and step % self.config.save_every_steps == 0:
         swap_probs.append(jnp.array([swap_prob]))
         energies_array.append(jnp.array([energies]))
-
+        if self.adaptive_temps:
+          temp_array.append(jnp.array([self.replica_temps]))
       if self.config.get_additional_metrics:
         # avg over all models
         acc = jnp.mean(acc)
@@ -576,33 +641,12 @@ class RE_Sampling_Experiment(Experiment):
         # hop avg over batch size and num models
         hops.append(get_hop(x, new_x))
 
-      if self.adaptive_temps:
-        if step == 1:
-          running_swap_prob = jnp.zeros_like(swap_prob)
-          self.replica_temps = self.init_replica_temps
-          alpha = jnp.zeros_like(swap_prob)
-        
-        running_swap_prob += swap_prob
+      if self.adaptive_temps and step % 2 == 0:
+        alpha = (1 - step/burn_in_length)
+        n, running_mean, running_ssd, replica_temps = adaptive_temp_step(n, running_mean, running_ssd, swap_prob, self.target_swap_prob, self.replica_temps, alpha)
+        self.replica_temps = replica_temps
+        swap_prob = jnp.zeros(swap_prob_shape)
 
-        if step % self.update_temps_every == 0:
-          running_swap_prob /= self.update_temps_every
-          log_lowest_temp = jnp.log(self.replica_temps[0])
-
-          log_temp_diffs = jnp.diff(jnp.log(self.replica_temps),axis=0)
-          #delta = -jnp.clip(jnp.log(running_swap_prob)-jnp.log(self.target_swap_prob),a_min=jnp.log(self.target_swap_prob))/jnp.log(self.target_swap_prob)
-          #log_temp_diffs = log_temp_diffs*(1+delta/2)
-
-          ratio_log_acc = jnp.clip(jnp.log(self.target_swap_prob)/jnp.log(running_swap_prob),a_min=0.5,a_max=2)
-          print(running_swap_prob[0][0])
-
-          alpha = self.config.chain_length/(self.config.chain_length + 9*step)
-          new_log_temp_diffs = ratio_log_acc*log_temp_diffs
-          log_temp_diffs = log_temp_diffs*(1-alpha) + new_log_temp_diffs*alpha
-
-          self.replica_temps = self.replica_temps.at[1:].set(jnp.clip(np.exp(jnp.cumsum(log_temp_diffs,axis=0)+log_lowest_temp),a_max=1000))
-          print(self.replica_temps[1][0])
-          temp_array.append(jnp.array([self.replica_temps]))
-          running_swap_prob = jnp.zeros_like(swap_prob)
 
       full_x = new_full_x
 
@@ -610,29 +654,21 @@ class RE_Sampling_Experiment(Experiment):
     swap_time = 0
 
     for step in tqdm.tqdm(range(burn_in_length, 1 + self.config.chain_length)):
+      start = time.time()
       rng = jax.random.fold_in(rng, step)
       step_rng = jax.random.split(rng,self.num_replicas)
       
-      start = time.time()
-      
       new_full_x, energies, full_state_array = full_step_and_energy(full_x,full_state_array,self.replica_temps,step_rng)
-
-      forward = time.time()
-      forward_time += forward - start
-
+      
       swap_rng = jax.random.split(step_rng[0],self.num_replicas-1)
 
-      new_particle_labels, swap_prob = exchange_step(energies, swap_rng)
-      new_particle_labels = jnp.expand_dims(new_particle_labels, axis = jnp.arange(len(full_x.shape))[2:])
-      new_full_x = jnp.take_along_axis(new_full_x,new_particle_labels,axis=0)
-      
+      new_full_x, new_swap_prob = full_exchange_step(new_full_x, energies, swap_rng, self.replica_temps, step % 2)
+      swap_prob += new_swap_prob
+
       new_x = new_full_x[0]
-      magnetizations.append(jnp.array([(2*new_x-1).sum(axis=[-1,-2])]))
 
-      swap = time.time()
-      swap_time += swap - forward
-
-      running_time += time.time() - start
+      n = step - burn_in_length + 1
+      magnetization_estimate = (n-1)/n*magnetization_estimate + 1/n*(jnp.array([(2*new_x-1).sum(axis=[-1,-2])]))
 
       if (
           self.config.save_samples or self.config.get_estimation_error
@@ -640,10 +676,12 @@ class RE_Sampling_Experiment(Experiment):
         chains = new_x.reshape(self.config.batch_size, -1)
         samples.append(chains[selected_chains])
 
-      if self.save_replica_data:
+        if self.save_replica_data:
           swap_probs.append(jnp.array([swap_prob]))
           energies_array.append(jnp.array([energies]))
-          temp_tracker_array.append(jnp.array([temp_tracker]))
+
+        magnetizations.append(jnp.array([magnetization_estimate]))
+
 
       if self.config.get_additional_metrics:
         # avg over all models
@@ -657,10 +695,9 @@ class RE_Sampling_Experiment(Experiment):
       mapped_sample = jax.device_put(mapped_sample, jax.devices('cpu')[0])
       chain.append(mapped_sample)
       full_x = new_full_x
+      running_time += time.time() - start
 
-    print(f'forward time: {forward_time}')
-    print(f'swap time: {swap_time}')
-
+    state_keys = list(state.keys())
     state = {state_keys[j]: full_state_array[0,j] for j in range(len(state_keys))}
 
     chain = jnp.array(chain)
@@ -682,16 +719,16 @@ class RE_Sampling_Experiment(Experiment):
       elif (
           self.config.get_estimation_error
       ):
-        saver.dump_samples(samples, visualize=False)
+        if self.config.save_samples:
+          saver.dump_samples(samples, visualize=False)
         # samples= np.array(samples)
         # params = params['params'][0].reshape(self.config_model.shape)
         saver.dump_params(params)
         # saver.plot_estimation_error(model, params, samples)
     
     if self.save_replica_data:
-        saver.dump_array(jnp.concatenate(swap_probs),'swap_probs')
-        saver.dump_array(jnp.concatenate(energies_array),'energies')
-        saver.dump_array(jnp.concatenate(temp_tracker_array),'temp_tracker')
+        #saver.dump_array(jnp.concatenate(swap_probs),'swap_probs')
+        #saver.dump_array(jnp.concatenate(energies_array),'energies')
         if self.adaptive_temps:
           saver.dump_array(jnp.concatenate(temp_array),'temps')
 
@@ -930,7 +967,8 @@ class CO_Experiment(Experiment):
     fn_reshape = lambda x: jnp.reshape(x, bshape + x.shape[1:])
     # burn in
     burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
-
+    energies_array = []
+    
     for step in tqdm.tqdm(range(1, burn_in_length)):
       cur_temp = t_schedule(step)
       params['temperature'] = init_temperature * cur_temp
@@ -946,6 +984,13 @@ class CO_Experiment(Experiment):
       )
 
       if step % self.config.log_every_steps == 0:
+        params['temperature'] = jnp.ones_like(params['temperature'])
+        energies = -model_frwrd(params,new_x)
+        if self.verbose:
+          print(new_x[0])
+          print(energies[0])
+        energies_array.append(jnp.array([energies]))
+        
         eval_val = obj_fn(samples=new_x, params=params)
         eval_val = eval_val.reshape(self.config.num_models, -1)
         ratio = jnp.max(eval_val, axis=-1).reshape(-1) / self.ref_obj
@@ -996,6 +1041,13 @@ class CO_Experiment(Experiment):
       )
       running_time += time.time() - start
       if step % self.config.log_every_steps == 0:
+        params['temperature'] = jnp.ones_like(params['temperature'])
+        energies = -model_frwrd(params,new_x)
+        if self.verbose:
+          print(new_x[0])
+          print(energies[0])
+        energies_array.append(jnp.array([energies]))
+
         eval_val = obj_fn(samples=new_x, params=params)
         eval_val = eval_val.reshape(self.config.num_models, -1)
         ratio = jnp.max(eval_val, axis=-1).reshape(-1) / self.ref_obj
@@ -1036,6 +1088,7 @@ class CO_Experiment(Experiment):
         chain, best_ratio[sample_mask], running_time, best_samples
     )
     saver.save_results(acc_ratios, hops, None, running_time)
+    saver.dump_array(jnp.concatenate(energies_array),'energies')
 
   def _initialize_chain_vars(self, bshape):
     t_schedule = self._build_temperature_schedule(self.config)
@@ -1073,7 +1126,7 @@ class RE_CO_Experiment(CO_Experiment):
     self.adaptive_temps = config.experiment.get('adaptive_temps', False)
     self.target_swap_prob = 0.2
     self.update_temps_every = 250
-
+    
   def _compute_chain(
       self,
       compiled_fns,
@@ -1103,147 +1156,64 @@ class RE_CO_Experiment(CO_Experiment):
     stp_burnin, stp_mixing, get_hop, obj_fn, model_frwrd = compiled_fns
     fn_reshape = lambda x: jnp.reshape(x, bshape + x.shape[1:])
     # burn in
-    burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
-
-    repeated_x = jnp.expand_dims(x, axis=0)
-    full_x = jnp.repeat(repeated_x, repeats=self.num_replicas,axis=0)
-
-    init_temperature = jnp.ones_like(init_temperature)
-    repeated_init_temperature = jnp.expand_dims(init_temperature, axis=-1)
-    init_temperature = jnp.repeat(repeated_init_temperature, repeats=self.batch_size,axis=-1)
-
-    params['temperature'] = init_temperature
-
-    state_keys = list(state.keys())
-    state_array = jnp.array([state[key] for key in state_keys])
-    repeated_state_array = jnp.expand_dims(state_array, axis=0)
-    full_state_array = jnp.repeat(repeated_state_array, repeats=self.num_replicas,axis=0)
+    full_x, params, full_state_array, init_replica_temps = self.get_init_replica_data(state,params,bshape,x)
     
-    self.init_replica_temps = jnp.expand_dims(self.replica_temps,axis=1+jnp.arange(len(init_temperature.shape)))*jnp.expand_dims(init_temperature,axis=0)
+    self.replica_temps = init_replica_temps
     
+    magnetizations = []
+
     if self.save_replica_data:
       #track the temperature of a particle
       swap_probs = []
       energies_array = []
-      temp_tracker_array = []
 
-      #temp_tracker = self.replica_temps.copy()
-      temp_tracker = None
       if self.adaptive_temps:
         temp_array = []
 
-    def step_and_energy(index):
-      params_copy = params.copy()
-      params_copy['temperature'] = self.replica_temps[index]
+    if self.config.num_models == 1:
+      swap_prob_shape = [self.num_replicas-1] + [x.shape[0]]
+    else:
+      swap_prob_shape = (self.num_replicas-1,) + bshape + (self.config.batch_size,) 
+    swap_prob = jnp.zeros(swap_prob_shape)
 
-      rng_new = jax.random.fold_in(rng, step*(self.num_replicas*2)+index)
-      step_rng = fn_reshape(jax.random.split(rng_new, math.prod(bshape)))
+    if self.adaptive_temps:
+      n = jnp.ones(swap_prob_shape)
+      running_mean = jnp.zeros(swap_prob_shape)
+      running_ssd = jnp.zeros(swap_prob_shape)
 
-      x = full_x[index]
-      state_array = full_state_array[index]
-      state = {state_keys[j]: state_array[j] for j in range(len(state_keys))}
+    full_step_and_energy, full_exchange_step, adaptive_temp_step = self._compile_exchange_fns(stp_burnin, model_frwrd, state, params, fn_reshape, bshape)
 
-      new_partial_x, new_state, acc = stp_burnin(
-          rng=step_rng,
-          x=x,
-          model_param=params_copy,
-          state=state,
-          x_mask=params_copy['mask'],
-      )
-
-      params_copy['temperature'] = init_temperature
-      energy = -model_frwrd(params_copy,new_partial_x)
-      new_state_array = jnp.array([new_state[key] for key in state_keys])
-      
-      return new_partial_x, energy, new_state_array
-
-    def exchange_step(full_x, energies, return_swap_prob = False, temp_tracker = None):
-
-      dims_to_add = len(full_x.shape)-len(energies.shape)
-      swap_shape = energies.shape[1:] + (1,)*dims_to_add
-
-      if return_swap_prob:
-        swap_probs = [0]*(self.num_replicas-1)
-
-      for i in range(self.num_replicas-2,-1,-1):
-        energy_diff = energies[i]-energies[i+1]
-        swap_prob = jnp.exp(jnp.clip((1/self.replica_temps[i]-1/self.replica_temps[i+1])*energy_diff,max=0))
-        swap_probs[i] = swap_prob
-
-        rng_swap = jax.random.fold_in(rng, step*(self.num_replicas*2)+self.num_replicas+i)
-        
-        dims_to_add = len(full_x[0].shape)-len(energies[0].shape)
-        swap = jax.random.bernoulli(rng_swap,swap_prob).reshape(swap_shape)       
-
-        swapped_first = jnp.where(swap,full_x[i+1],full_x[i])
-        swapped_second = jnp.where(swap,full_x[i],full_x[i+1])
-        full_x = full_x.at[i].set(swapped_first)
-        full_x = full_x.at[i+1].set(swapped_second)
-
-        swap = jnp.reshape(swap,energies.shape[1:])
-        swapped_first = jnp.where(swap,energies[i+1],energies[i])
-        swapped_second = jnp.where(swap,energies[i],energies[i+1])
-        energies = energies.at[i].set(swapped_first)
-        energies = energies.at[i+1].set(swapped_second)
-
-        if temp_tracker is not None:
-          swap = jnp.reshape(swap,temp_tracker.shape[1:])
-          swapped_first = jnp.where(swap,temp_tracker[i+1],temp_tracker[i])
-          swapped_second = jnp.where(swap,temp_tracker[i],temp_tracker[i+1])
-          temp_tracker = temp_tracker.at[i].set(swapped_first)
-          temp_tracker = temp_tracker.at[i+1].set(swapped_second)
-
-      if return_swap_prob:
-        if temp_tracker is not None:
-          return full_x, jnp.array(swap_probs), temp_tracker
-        return full_x, jnp.array(swap_probs)
-      
-      return full_x
-
-    full_step_and_energy = jax.vmap(step_and_energy)
+    burn_in_length = int(self.config.chain_length * self.config.ess_ratio) + 1
 
     for step in tqdm.tqdm(range(1, burn_in_length)):
       
       cur_temp = t_schedule(step)
       if step == 1 or not self.adaptive_temps:
-        self.replica_temps = self.init_replica_temps * cur_temp
-
-      new_full_x, energies, full_state_array = full_step_and_energy(jnp.arange(self.num_replicas))
+        self.replica_temps = init_replica_temps * cur_temp
       
-      if self.save_replica_data:
-        if temp_tracker is not None:
-          new_full_x, swap_prob, temp_tracker = exchange_step(new_full_x,energies,return_swap_prob=True,temp_tracker=temp_tracker)
-        else:
-          new_full_x, swap_prob = exchange_step(new_full_x,energies,True)
       else:
-        new_full_x = exchange_step(new_full_x,energies)
+        self.replica_temps = self.replica_temps.at[0].set(init_replica_temps[0]*cur_temp)
 
-      if self.adaptive_temps:
-        if step == 1:
-          running_swap_prob = jnp.zeros_like(swap_prob)
-        
-        running_swap_prob += swap_prob
 
-        if step % self.update_temps_every == 0:
-          running_swap_prob /= self.update_temps_every
-          log_lowest_temp = jnp.log(self.replica_temps[0])
+      rng = jax.random.fold_in(rng, step)
+      step_rng = jax.random.split(rng,self.num_replicas)
 
-          log_temp_diffs = jnp.diff(jnp.log(self.replica_temps),axis=0)
-          #delta = -jnp.clip(jnp.log(running_swap_prob)-jnp.log(self.target_swap_prob),a_min=jnp.log(self.target_swap_prob))/jnp.log(self.target_swap_prob)
-          #log_temp_diffs = log_temp_diffs*(1+delta/2)
+      new_full_x, energies, full_state_array = full_step_and_energy(full_x,full_state_array,self.replica_temps,step_rng)
+      
+      swap_rng = jax.random.split(step_rng[0],self.num_replicas-1)
 
-          ratio_log_acc = jnp.clip(jnp.log(self.target_swap_prob)/jnp.log(running_swap_prob),a_min=0.5,a_max=2)
-          print(ratio_log_acc[1][0][0])
-          log_temp_diffs = log_temp_diffs*ratio_log_acc
-
-          self.replica_temps = self.replica_temps.at[1:].set(jnp.clip(np.exp(jnp.cumsum(log_temp_diffs,axis=0)+log_lowest_temp),a_max=10))
-          print(self.replica_temps[1][0][0])
-          temp_array.append(jnp.array([self.replica_temps]))
-          running_swap_prob = jnp.zeros_like(swap_prob)
+      new_full_x, new_swap_prob = full_exchange_step(new_full_x, energies, swap_rng, self.replica_temps, step % 2)
+      swap_prob += new_swap_prob
 
       new_x = new_full_x[0]
 
       #new_x, energy = step_and_energy_burnin(0)
+
+      if self.adaptive_temps and step % 2 == 0:
+        alpha = (1 - step/self.config.chain_length)
+        n, running_mean, running_ssd, replica_temps = adaptive_temp_step(n, running_mean, running_ssd, swap_prob, self.target_swap_prob, self.replica_temps, alpha)
+        self.replica_temps = replica_temps
+        swap_prob = jnp.zeros(swap_prob_shape)
 
       if step % self.config.log_every_steps == 0:
         eval_val = obj_fn(samples=new_x, params=params)
@@ -1260,7 +1230,8 @@ class RE_CO_Experiment(CO_Experiment):
         if self.save_replica_data:
           swap_probs.append(jnp.array([swap_prob]))
           energies_array.append(jnp.array([energies]))
-          temp_tracker_array.append(jnp.array([temp_tracker]))
+          if self.adaptive_temps:
+            temp_array.append(jnp.array([self.replica_temps]))
 
         if self.config.save_samples or self.config_model.name == 'normcut':
           step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
@@ -1276,6 +1247,7 @@ class RE_CO_Experiment(CO_Experiment):
           best_samples = jnp.where(
               jnp.expand_dims(is_better, -1), chosen_samples, best_samples
           )
+      
 
       if self.config.get_additional_metrics:
         # avg over all models
@@ -1284,29 +1256,37 @@ class RE_CO_Experiment(CO_Experiment):
         acc_ratios.append(acc)
         # hop avg over batch size and num models
         hops.append(get_hop(x, new_x))
+
       full_x = new_full_x
 
     for step in tqdm.tqdm(range(burn_in_length, 1 + self.config.chain_length)):
-      
-      cur_temp = t_schedule(step)
-      if not self.adaptive_temps:
-        self.replica_temps = self.init_replica_temps * cur_temp
-
       start = time.time()
-      new_full_x, energies, full_state_array = full_step_and_energy(jnp.arange(self.num_replicas))
-
-      if self.save_replica_data:
-        if temp_tracker is not None:
-          new_full_x, swap_prob, temp_tracker = exchange_step(new_full_x,energies,return_swap_prob=True,temp_tracker=temp_tracker)
-        else:
-          new_full_x, swap_prob = exchange_step(new_full_x,energies,True)
+      cur_temp = t_schedule(step)
+      if step == 1 or not self.adaptive_temps:
+        self.replica_temps = init_replica_temps * cur_temp
+      
       else:
-        new_full_x = exchange_step(new_full_x,energies)
+        self.replica_temps = self.replica_temps.at[0].set(init_replica_temps[0]*cur_temp)
 
+      rng = jax.random.fold_in(rng, step)
+      step_rng = jax.random.split(rng,self.num_replicas)
+
+      new_full_x, energies, full_state_array = full_step_and_energy(full_x,full_state_array,self.replica_temps,step_rng)
+      
+      swap_rng = jax.random.split(step_rng[0],self.num_replicas-1)
+
+      new_full_x, new_swap_prob = full_exchange_step(new_full_x, energies, swap_rng, self.replica_temps, step % 2)
+      swap_prob += new_swap_prob
+
+      if self.adaptive_temps and step % 2 == 0:
+        alpha = (1 - step/self.config.chain_length)
+        n, running_mean, running_ssd, replica_temps = adaptive_temp_step(n, running_mean, running_ssd, swap_prob, self.target_swap_prob, self.replica_temps, alpha)
+        self.replica_temps = replica_temps
+        swap_prob = jnp.zeros(swap_prob_shape)
+      
       new_x = new_full_x[0]
-      
       running_time += time.time() - start
-      
+
       if step % self.config.log_every_steps == 0:
         eval_val = obj_fn(samples=new_x, params=params)
         eval_val = eval_val.reshape(self.config.num_models, -1)
@@ -1322,7 +1302,8 @@ class RE_CO_Experiment(CO_Experiment):
         if self.save_replica_data:
           swap_probs.append(jnp.array([swap_prob]))
           energies_array.append(jnp.array([energies]))
-          temp_tracker_array.append(jnp.array([temp_tracker]))
+          if self.adaptive_temps:
+            temp_array.append(jnp.array([self.replica_temps]))
 
         if self.config.save_samples or self.config_model.name == 'normcut':
           step_chosen = jnp.argmax(eval_val, axis=-1, keepdims=True)
@@ -1345,7 +1326,9 @@ class RE_CO_Experiment(CO_Experiment):
         acc_ratios.append(acc)
         # hop avg over batch size and num models
         hops.append(get_hop(x, new_x))
+      
       full_x = new_full_x
+      
 
     if not (self.config.save_samples or self.config_model.name == 'normcut'):
       best_samples = []
@@ -1357,7 +1340,6 @@ class RE_CO_Experiment(CO_Experiment):
     if self.save_replica_data:
       saver.dump_array(jnp.concatenate(swap_probs),'swap_probs')
       saver.dump_array(jnp.concatenate(energies_array),'energies')
-      saver.dump_array(jnp.concatenate(temp_tracker_array),'temp_tracker')
       if self.adaptive_temps:
         saver.dump_array(jnp.concatenate(temp_array),'temps')
 
