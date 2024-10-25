@@ -2,7 +2,7 @@
 This repository builds upon DISCS: A Benchmark for Discrete Sampling: [paper](https://openreview.net/pdf?id=oi1MUMk5NF)
 
 ## Replica Exchange
-This fork adds two new experiment types, RE_Sampling_Experiment and RE_CO_Experiment, which allow the user to incorporate Replica Exchange (RE) in sampling resp. combinatorial optimization experiments. It is compatible with any existing sampler in the package. The extra parameters to configured under config.experiment are num_replicas , min_temperature, max_temperature, adaptive_temps (boolean, whether to use an adaptive temperature schedule) and save_replica_data (boolean, whether to save replica energies and swapping probabilities of experiments). For an example, see <code>experiment_runner.py<\code>.
+This fork adds two new experiment types, RE_Sampling_Experiment and RE_CO_Experiment, which allow the user to incorporate Replica Exchange (RE) in sampling resp. combinatorial optimization experiments. It is compatible with any existing sampler in the package. The extra parameters to configured under config.experiment are num_replicas , min_temperature, max_temperature, adaptive_temps (boolean, whether to use an adaptive temperature schedule) and save_replica_data (boolean, whether to save replica energies and swapping probabilities of experiments). For an example, see <code>experiment_runner.py</code>.
 
 ## Data
 The data used in this package could be found [here](https://drive.google.com/drive/u/1/folders/1nEppxuUJj8bsV9Prc946LN_buo30AnDx).
