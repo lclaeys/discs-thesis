@@ -9,39 +9,70 @@ from discs.common import configs as common_configs
 from discs.common import utils
 import discs.common.experiment_saver as saver_mod
 from ml_collections import config_flags
+import numpy as np
+import tensorflow as tf
 
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(e)  # Handle any runtime initialization errors
 # EXPERIMENTS 
-batch_size = 10
-
+batch_size = 1
+temps = np.logspace(-1,0,10)
+#temps = [0.22]
+chain_length= 600000
+final_temps = [0.05]
 experiments = [
-                  {'experiment_name': f'replica exchange (10 replicas) (adaptive)',
-                 'experiment': {'t_schedule': 'constant',
-                                 'name': 'RE_CO_Experiment',
-                                 'init_temperature': 1,
-                                 'decay_rate': .1,
-                                 'minimum_temperature': 1,
-                                 'maximum_temperature': 10,
-                                 'num_replicas': 10,
-                                 'chain_length': 500000, 
-                                 'batch_size': batch_size,
-                                 'save_replica_data': True,
-                                 'adaptive_temps':True
-                                },
-                  'sampler': {'adaptive': True}},
-                  {'experiment_name': 'exp decaying temperature',
+  #  {'experiment_name': f'replica exchange (20 replicas)',
+  #                'experiment': {'t_schedule': 'constant',
+  #                                'name': 'RE_CO_Experiment',
+  #                                'init_temperature': 1,
+  #                                'decay_rate': .1,
+  #                                'minimum_temperature': .05,
+  #                                'maximum_temperature': 1,
+  #                                'num_replicas': 20,
+  #                                'chain_length': chain_length, 
+  #                                'batch_size': batch_size,
+  #                                'save_replica_data': True,
+  #                                'save_every_steps': chain_length // 1000,
+  #                                'log_every_steps': chain_length // 1000,
+  #                                'adaptive_temps':True
+  #                               },
+  #                 'sampler': {'adaptive': True}}
+                  ] + [
+                     {'experiment_name': f'exp decaying temperature (T={final_temp})',
                 'experiment': {'t_schedule': 'exp_decay',
+                               'name': 'CO_Experiment',
                                'init_temperature': 1,
-                               'chain_length': 5000000,
+                               'chain_length': chain_length,
                                'batch_size': batch_size,
-                               'decay_rate': .1  },
-                'sampler': {'adaptive': True}},
+                               'decay_rate': final_temp,
+                               'save_every_steps': chain_length // 1000,
+                               'log_every_steps': chain_length // 1000
+                               },
+                'sampler': {'adaptive': True}} for final_temp in final_temps
+                ] + [
+                #    {
+                #   'experiment_name': f'constant temperature (T={temp:.2f})',
+                # 'experiment': {'t_schedule': 'constant',
+                #                'name': 'CO_Experiment',
+                #                'init_temperature': temp,
+                #                'chain_length': chain_length,
+                #                'batch_size': batch_size,
+                #                'save_every_steps': chain_length// 10000,
+                #                'log_every_steps': chain_length // 10000
+                #                },
+                # 'sampler': {'adaptive': True}} for temp in temps
                 ]
 
 # CONFIG
 model_name = 'mis'
 sampler_name = 'path_auxiliary'
 graph_type = 'ertest'
-experiment_type = 'new_re_800s'
+experiment_type = 'full_re_10k10'
 experiment_folder = f'{sampler_name}_{graph_type}_{experiment_type}' 
 
 experiment_config = importlib.import_module(

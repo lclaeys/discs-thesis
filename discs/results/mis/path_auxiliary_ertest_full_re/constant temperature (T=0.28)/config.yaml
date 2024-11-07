@@ -1,0 +1,84 @@
+!!python/object:ml_collections.config_dict.config_dict.ConfigDict
+_convert_dict: true
+_fields:
+  experiment: !!python/object:ml_collections.config_dict.config_dict.ConfigDict
+    _convert_dict: true
+    _fields:
+      batch_size: 1
+      chain_length: 1000000
+      co_opt_prob: true
+      decay_rate: 0.01
+      ess_ratio: 0.5
+      evaluator: co_eval
+      fig_folder: ./discs/results/mis/path_auxiliary_ertest_full_re/constant temperature
+        (T=0.28)/logs/figures
+      final_temperature: 0.0001
+      get_additional_metrics: false
+      get_estimation_error: true
+      init_temperature: !!python/object/apply:numpy.core.multiarray.scalar
+      - !!python/object/apply:numpy.dtype
+        args:
+        - f8
+        - false
+        - true
+        state: !!python/tuple
+        - 3
+        - <
+        - null
+        - null
+        - null
+        - -1
+        - -1
+        - 0
+      - !!binary |
+        rprKAPLO0T8=
+      log_every_steps: 1000
+      name: CO_Experiment
+      num_models: 128
+      plot_every_steps: 1
+      run_parallel: true
+      save_every_steps: 1000
+      save_root: ./discs/results/mis/path_auxiliary_ertest_full_re/constant temperature
+        (T=0.28)
+      save_samples: true
+      shuffle_buffer_size: 0
+      t_schedule: constant
+      use_tqdm: false
+      window_size: 10
+      window_stride: 10
+    _locked: false
+    _type_safe: true
+  experiment_name: constant temperature (T=0.28)
+  model: !!python/object:ml_collections.config_dict.config_dict.ConfigDict
+    _convert_dict: true
+    _fields:
+      cfg_str: r-800
+      data_root: ./sco/
+      graph_type: ertest
+      max_num_edges: 47885
+      max_num_nodes: 800
+      name: mis
+      num_categories: 2
+      num_instances: 128
+      num_models: 128
+      penalty: 1.001
+      rand_type: '800'
+      save_dir_name: mis
+      shape: !!python/tuple
+      - 0
+    _locked: false
+    _type_safe: true
+  sampler: !!python/object:ml_collections.config_dict.config_dict.ConfigDict
+    _convert_dict: true
+    _fields:
+      adaptive: true
+      approx_with_grad: true
+      balancing_fn_type: SQRT
+      name: path_auxiliary
+      num_flips: 1
+      target_acceptance_rate: 0.574
+      use_fast_path: true
+    _locked: false
+    _type_safe: true
+_locked: false
+_type_safe: true

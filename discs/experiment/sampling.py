@@ -233,7 +233,7 @@ class Experiment:
       
       return particle_labels, swap_probs
     
-    if not self.config.evaluator == 'co_eval':
+    if not self.config.evaluator == 'co_eval' or not self.parallel:
       full_step_and_energy = jax.vmap(jax.jit(functools.partial(step_and_energy, params=init_params)))
       exchange_step_even = jax.jit(functools.partial(exchange_step,offset=0))
       exchange_step_odd = jax.jit(functools.partial(exchange_step,offset=1))
@@ -282,7 +282,7 @@ class Experiment:
       new_running_mean = jnp.where(outside_bound, jnp.zeros_like(new_running_mean),new_running_mean)
       new_running_ssd = jnp.where(outside_bound, jnp.zeros_like(new_running_ssd),new_running_ssd)
       
-      n = jnp.where(outside_bound, jnp.ones_like(n),n+1)
+      n = jnp.where(outside_bound, jnp.ones_like(n),jnp.minimum(n+1,2000))
 
       return n, new_running_mean, new_running_ssd, replica_temps
     
